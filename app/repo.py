@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
+import threading
 import time
 from typing import Any
 
 from . import db, security
+
+# 事件进度是「读-改-写」三段：对账线程与事件确认线程会同时追加同一条事件的进度，
+# 无锁会丢更新。这把锁只保护进程内这两条后台线程的互斥（架构是单进程多线程）。
+_event_lock = threading.Lock()
 
 SENSITIVE_SETTINGS = {
     "admin_password",
@@ -18,7 +24,7 @@ SENSITIVE_SETTINGS = {
 }
 
 
-def _is_hhmm(value: str) -> bool:
+def is_hhmm(value: str) -> bool:
     """校验 HH:MM 时刻，支持 00:00–23:59。"""
     parts = value.split(":")
     if len(parts) != 2:
@@ -91,12 +97,34 @@ def clear_flag(key: str) -> None:
     db.execute("DELETE FROM flags WHERE key=?", (key,))
 
 
+def bump_flag(key: str) -> int:
+    """把标记的计数 +1 并返回新值；标记不存在就从 1 开始（created_at 同时置为此刻）。
+
+    只服务「同一条事件里累计了多少次」这类场景（目前是单机保活的重试次数）：
+    机器躺一整天也只有一个事件，次数得有个地方存，不能靠数进度行 ——
+    进度有上限、会被裁掉最旧的。
+    """
+    db.execute(
+        "INSERT INTO flags(key, created_at, value) VALUES(?, ?, 1) "
+        "ON CONFLICT(key) DO UPDATE SET value = value + 1",
+        (key, int(time.time())),
+    )
+    row = db.query_one("SELECT value FROM flags WHERE key=?", (key,))
+    return int(row["value"]) if row is not None else 1
+
+
 def flag_age(key: str) -> float:
     """这个标记是多久以前设的（秒）；不存在返回 -1，表示「可以立刻执行」。"""
     row = db.query_one("SELECT created_at FROM flags WHERE key=?", (key,))
     if row is None:
         return -1.0
     return time.time() - float(row["created_at"])
+
+
+def flag_value(key: str) -> int:
+    """标记附带的值（读取告警用它记「连续失败几次」）；不存在返回 0。"""
+    row = db.query_one("SELECT value FROM flags WHERE key=?", (key,))
+    return int(row["value"] or 0) if row is not None else 0
 
 
 def clear_flags_like(prefix: str) -> None:
@@ -149,13 +177,23 @@ def is_session_revoked(token_id: str) -> bool:
 
 SERVER_COLUMNS = (
     "id, label, access_key_id, access_key_secret, region_id, site, instance_id, "
-    "quota_gb, threshold_gb, remark, traffic_used, instance_status, stopped_mode, "
+    "quota_gb, threshold_gb, remark, traffic_used, instance_status, stop_mode, stopped_mode, "
     "public_ip, traffic_checked_at, status_checked_at, monthly_cost, balance_amount, "
     "billing_currency, billing_cycle, billing_updated_at, billing_error, created_at, sort_order"
 )
 
 # 站点取值只有两个；其余一律归一到中国站，避免脏数据流到 endpoint 解析里
 SITE_TYPES = ("china", "international")
+
+# 实例设置里可选的停机模式：StopCharging = 节省停机（不计规格费），Stop = 普通停机。
+# 老库 / 脏值一律按节省停机处理：这是加上这个选项之前全项目的固定行为，升级后不变。
+STOP_MODES = ("StopCharging", "Stop")
+DEFAULT_STOP_MODE = "StopCharging"
+
+
+def normalize_stop_mode(value: Any) -> str:
+    mode = str(value or "").strip()
+    return mode if mode in STOP_MODES else DEFAULT_STOP_MODE
 
 
 def normalize_site(value: Any) -> str:
@@ -166,6 +204,7 @@ def normalize_site(value: Any) -> str:
 def _server_row(row: Any, decrypt_secret: bool = False) -> dict[str, Any]:
     item = dict(row)
     item["site"] = normalize_site(item.get("site"))
+    item["stop_mode"] = normalize_stop_mode(item.get("stop_mode"))
     secret = item.pop("access_key_secret", "") or ""
     item["secret_configured"] = bool(secret)
     if decrypt_secret:
@@ -205,6 +244,24 @@ def get_server(server_id: int, decrypt_secret: bool = False) -> dict[str, Any] |
     return _server_row(row, decrypt_secret) if row else None
 
 
+def _gb_value(raw: Any, default: float, label: str) -> float:
+    """把配额 / 阈值转成有限浮点数。
+
+    float("inf") 能绕过 quota>0、threshold<=quota 两个判断直接落库，之后所有
+    返回服务器的接口都会因为 JSON 不接受 Infinity 变成 400，整页打不开；
+    nan 则触发 SQLite 的 NOT NULL 约束变成 500。所以这里先挡在写入之前。
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}必须是数字") from None
+    if not math.isfinite(value):
+        raise ValueError(f"{label}必须是有限数字")
+    return value
+
+
 def upsert_server(payload: dict[str, Any]) -> int:
     server_id = int(payload.get("id") or 0)
     label = str(payload.get("label") or "").strip()
@@ -213,18 +270,27 @@ def upsert_server(payload: dict[str, Any]) -> int:
     region = str(payload.get("region_id") or "").strip()
     site = normalize_site(payload.get("site"))
     instance = str(payload.get("instance_id") or "").strip()
-    quota = float(payload.get("quota_gb") or 200)
-    threshold = float(payload.get("threshold_gb") or 188)
+    quota = _gb_value(payload.get("quota_gb"), 200.0, "总配额")
+    threshold = _gb_value(payload.get("threshold_gb"), 188.0, "阈值")
     remark = str(payload.get("remark") or "").strip()
+    stop_mode_raw = payload.get("stop_mode")
+    # 没传（老前端 / 只改别处的接口）就保持原值；新建时落到默认的节省停机
+    stop_mode = (
+        normalize_stop_mode(stop_mode_raw) if stop_mode_raw is not None else ""
+    )
 
     if not region:
         raise ValueError("地域不能为空")
+    # 显式区分「没传」与「传了 0/负数」：前端清空输入框会传 0 过来，之前被
+    # `or 200` 静默吞成默认值，导致用户以为改成了 0 实际还是 200。
+    if quota <= 0:
+        raise ValueError("总配额必须大于 0")
     if threshold <= 0 or threshold > quota:
         raise ValueError("阈值必须大于 0 且不超过总配额")
 
     if server_id:
         existing = db.query_one(
-            "SELECT access_key_id, access_key_secret, site, instance_id FROM servers WHERE id=?",
+            "SELECT access_key_id, access_key_secret, site, instance_id, stop_mode FROM servers WHERE id=?",
             (server_id,),
         )
         if existing is None:
@@ -234,6 +300,9 @@ def upsert_server(payload: dict[str, Any]) -> int:
         if payload.get("site") is None:
             # 老前端不传这个字段时保持原值，别把已有配置默默重置成中国站
             site = normalize_site(existing["site"])
+        if stop_mode_raw is None:
+            # 同理：只调用其它字段的接口不能把停机模式重置回默认
+            stop_mode = normalize_stop_mode(existing["stop_mode"])
         encrypted = security.encrypt(sk) if sk else existing["access_key_secret"]
         # 换了账号 / 实例 / 站点，旧账单就不是这台机器的了，必须清掉重查
         billing_changed = (
@@ -249,10 +318,22 @@ def upsert_server(payload: dict[str, Any]) -> int:
         )
         db.execute(
             "UPDATE servers SET label=?, access_key_id=?, access_key_secret=?, region_id=?, "
-            "site=?, instance_id=?, quota_gb=?, threshold_gb=?, remark=?"
+            "site=?, instance_id=?, quota_gb=?, threshold_gb=?, remark=?, stop_mode=?"
             + reset_billing
             + " WHERE id=?",
-            (label or ak[-6:], ak, encrypted, region, site, instance, quota, threshold, remark, server_id),
+            (
+                label or ak[-6:],
+                ak,
+                encrypted,
+                region,
+                site,
+                instance,
+                quota,
+                threshold,
+                remark,
+                stop_mode,
+                server_id,
+            ),
         )
         return server_id
 
@@ -262,7 +343,7 @@ def upsert_server(payload: dict[str, Any]) -> int:
         raise ValueError("新建服务器必须填写 AccessKey Secret")
     return db.insert(
         "INSERT INTO servers(label, access_key_id, access_key_secret, region_id, site, instance_id, "
-        "quota_gb, threshold_gb, remark, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "quota_gb, threshold_gb, remark, stop_mode, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (
             label or ak[-6:],
             ak,
@@ -273,6 +354,7 @@ def upsert_server(payload: dict[str, Any]) -> int:
             quota,
             threshold,
             remark,
+            stop_mode or DEFAULT_STOP_MODE,
             int(time.time()),
         ),
     )
@@ -306,16 +388,40 @@ def delete_server(server_id: int) -> None:
     used = db.query_one("SELECT 1 FROM shift_members WHERE server_id=?", (server_id,))
     if used is not None:
         raise ValueError("该服务器仍在某个换班组里，请先移出")
-    db.execute("DELETE FROM servers WHERE id=?", (server_id,))
-    db.execute("DELETE FROM keepalives WHERE server_id=?", (server_id,))
-    db.execute("DELETE FROM traffic_samples WHERE server_id=?", (server_id,))
-    # 目标没了，DNS 绑定必须一并松掉，否则记录还挂在已经不存在的机器上
-    db.execute(
-        "UPDATE dns_records SET target_kind='', target_id=0, last_ip='', "
-        "last_status='', last_at=0, updated_at=? "
-        "WHERE target_kind='server' AND target_id=?",
-        (int(time.time()), server_id),
-    )
+    # 多步删除包进一个事务：中途任何一条失败都整体回滚，别留半截状态。
+    conn = db.connect()
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DELETE FROM servers WHERE id=?", (server_id,))
+        conn.execute("DELETE FROM keepalives WHERE server_id=?", (server_id,))
+        conn.execute("DELETE FROM traffic_samples WHERE server_id=?", (server_id,))
+        # 这台机器专属的一次性标记一并清掉。SQLite 的 AUTOINCREMENT 不复用 id，
+        # 留着不会被新机器撞上，但也没人再去清 —— 只能等 90 天的兜底清理，白占表。
+        conn.execute(
+            "DELETE FROM flags WHERE key IN (?,?,?,?,?,?,?)",
+            (
+                f"read_err:{server_id}",
+                f"keepalive_err:{server_id}",
+                f"keepalive_fail:{server_id}",
+                f"keepalive_tries:{server_id}",
+                # 休止时段标记：机器删了还留着，重新加一台同 id 永远进不了运行窗口
+                f"keepalive_rest:{server_id}",
+                f"keepalive_rest_fail:{server_id}",
+                # 1.2.36 及以前用过的等待标记，已不再写入，顺手把残留扫掉
+                f"keepalive_wait:{server_id}",
+            ),
+        )
+        # 目标没了，DNS 绑定必须一并松掉，否则记录还挂在已经不存在的机器上
+        conn.execute(
+            "UPDATE dns_records SET target_kind='', target_id=0, last_ip='', "
+            "last_status='', last_at=0, updated_at=? "
+            "WHERE target_kind='server' AND target_id=?",
+            (int(time.time()), server_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def update_server_site(server_id: int, site: str) -> None:
@@ -420,6 +526,20 @@ def add_sample(server_id: int, used: float, status: str) -> None:
     )
 
 
+def last_sample_ts(server_id: int) -> int:
+    """这台机器最近一次流量采样的时间戳；从没采过返回 0。
+
+    用来区分「本月还没见过读数」（月初归零）和「本月读过又突然变空」（接口抖动）：
+    同月内累计流量只会涨，空读数只能是丢了数据。
+    """
+    row = db.query_one(
+        "SELECT MAX(ts) AS ts FROM traffic_samples WHERE server_id=?", (server_id,)
+    )
+    if row is None or row["ts"] is None:
+        return 0
+    return int(row["ts"])
+
+
 def list_samples(server_id: int, hours: int = 72) -> list[dict[str, Any]]:
     since = int(time.time()) - hours * 3600
     rows = db.query(
@@ -443,7 +563,8 @@ def latest_samples(server_id: int) -> dict[str, Any] | None:
 
 def list_keepalives() -> list[dict[str, Any]]:
     rows = db.query(
-        "SELECT k.id, k.server_id, k.enabled, k.created_at, s.label, s.instance_status, "
+        "SELECT k.id, k.server_id, k.enabled, k.created_at, k.start_time, k.end_time, "
+        "k.start_day, k.end_day, s.label, s.instance_status, s.stop_mode, "
         "s.stopped_mode, s.public_ip, s.traffic_used, s.quota_gb, s.threshold_gb, "
         "s.instance_id, s.region_id, s.site, s.status_checked_at "
         "FROM keepalives k JOIN servers s ON s.id=k.server_id ORDER BY k.id"
@@ -451,31 +572,108 @@ def list_keepalives() -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def get_keepalive(keepalive_id: int) -> dict[str, Any] | None:
+    row = db.query_one("SELECT * FROM keepalives WHERE id=?", (keepalive_id,))
+    return dict(row) if row else None
+
+
 def keepalive_server_ids() -> set[int]:
     return {int(row["server_id"]) for row in db.query("SELECT server_id FROM keepalives WHERE enabled=1")}
 
 
-def add_keepalive(server_id: int, enabled: bool = True) -> int:
+def keepalive_schedules() -> dict[int, dict[str, Any]]:
+    """server_id → 运行窗口。确认器每 5 秒一轮，别为每条事件单独查一次库。"""
+    return {
+        int(row["server_id"]): dict(row)
+        for row in db.query(
+            "SELECT server_id, enabled, start_time, end_time, start_day, end_day FROM keepalives"
+        )
+    }
+
+
+def add_keepalive(
+    server_id: int,
+    enabled: bool = True,
+    *,
+    start_time: str = "",
+    end_time: str = "",
+    start_day: int = 0,
+    end_day: int = 0,
+) -> int:
     if db.query_one("SELECT 1 FROM servers WHERE id=?", (server_id,)) is None:
         raise ValueError("服务器不存在")
-    existing = db.query_one("SELECT id FROM keepalives WHERE server_id=?", (server_id,))
-    if existing is not None:
-        db.execute("UPDATE keepalives SET enabled=? WHERE id=?", (1 if enabled else 0, existing["id"]))
-        return int(existing["id"])
-    return db.insert(
-        "INSERT INTO keepalives(server_id, enabled, created_at) VALUES(?,?,?)",
-        (server_id, 1 if enabled else 0, int(time.time())),
+    enabled_val = 1 if enabled else 0
+    # 原子 upsert：以前是「先查再插」，并发两个请求会同时撞上 server_id 的
+    # UNIQUE 约束报 500。ON CONFLICT 覆盖开关与时间窗，不动 created_at。
+    db.execute(
+        "INSERT INTO keepalives(server_id, enabled, start_time, end_time, start_day, end_day, created_at) "
+        "VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(server_id) DO UPDATE SET enabled=excluded.enabled, "
+        "start_time=excluded.start_time, end_time=excluded.end_time, "
+        "start_day=excluded.start_day, end_day=excluded.end_day",
+        (server_id, enabled_val, start_time, end_time, int(start_day), int(end_day), int(time.time())),
+    )
+    # 重新加入 / 改了窗口，旧的休止标记就作废
+    _clear_keepalive_flags(server_id)
+    row = db.query_one("SELECT id FROM keepalives WHERE server_id=?", (server_id,))
+    return int(row["id"]) if row else 0
+
+
+def _clear_keepalive_flags(server_id: int) -> None:
+    """清掉这台机器的保活临时标记。暂停 / 移出 / 改窗口后必须清：
+
+    keepalive_rest 留着，下一轮巡检会以为「还在休止时段」而不发「窗口恢复」；
+    keepalive_resume_pending 留着，下次中断会被当成「窗口到点的延续」而不推通知。
+    """
+    db.execute(
+        "DELETE FROM flags WHERE key IN (?,?,?)",
+        (
+            f"keepalive_rest:{server_id}",
+            f"keepalive_rest_fail:{server_id}",
+            f"keepalive_resume_pending:{server_id}",
+        ),
     )
 
 
 def set_keepalive_enabled(keepalive_id: int, enabled: bool) -> None:
     db.execute("UPDATE keepalives SET enabled=? WHERE id=?", (1 if enabled else 0, keepalive_id))
+    if not enabled:
+        row = db.query_one("SELECT server_id FROM keepalives WHERE id=?", (keepalive_id,))
+        if row is not None:
+            _clear_keepalive_flags(int(row["server_id"]))
+
+
+def update_keepalive(
+    keepalive_id: int,
+    *,
+    enabled: bool = True,
+    start_time: str = "",
+    end_time: str = "",
+    start_day: int = 0,
+    end_day: int = 0,
+) -> None:
+    """改开关与运行窗口。server_id 不可改 —— 换机器就是删一条再加一条。"""
+    db.execute(
+        "UPDATE keepalives SET enabled=?, start_time=?, end_time=?, start_day=?, end_day=? "
+        "WHERE id=?",
+        (
+            1 if enabled else 0,
+            start_time,
+            end_time,
+            int(start_day),
+            int(end_day),
+            keepalive_id,
+        ),
+    )
 
 
 def delete_keepalive(keepalive_id: int) -> None:
     # 只删保活任务本身。DNS 绑定是用户在 DNS 页显式建立的，不跟着一起清 ——
     # 一台机器可能同时挂着别的用途的域名，删个保活就把人家的解析抹了太粗暴。
+    row = db.query_one("SELECT server_id FROM keepalives WHERE id=?", (keepalive_id,))
     db.execute("DELETE FROM keepalives WHERE id=?", (keepalive_id,))
+    if row is not None:
+        _clear_keepalive_flags(int(row["server_id"]))
 
 
 # --------------------------------------------------------------------------
@@ -605,8 +803,8 @@ def get_group(group_id: int) -> dict[str, Any] | None:
 def list_members(group_id: int) -> list[dict[str, Any]]:
     rows = db.query(
         "SELECT m.id, m.group_id, m.server_id, m.position, m.hours, m.enabled, "
-        "m.slot_name, m.start_time, m.end_time, "
-        "s.label, s.instance_id, s.region_id, s.site, s.instance_status, s.stopped_mode, "
+        "m.slot_name, m.start_time, m.end_time, m.days, "
+        "s.label, s.instance_id, s.region_id, s.site, s.instance_status, s.stop_mode, s.stopped_mode, "
         "s.public_ip, s.traffic_used, s.quota_gb, s.threshold_gb, s.status_checked_at "
         "FROM shift_members m LEFT JOIN servers s ON s.id=m.server_id "
         "WHERE m.group_id=? ORDER BY m.position",
@@ -648,6 +846,14 @@ def upsert_group(payload: dict[str, Any]) -> int:
     name = str(payload.get("name") or "").strip() or "换班组"
     enabled = 1 if payload.get("enabled", True) else 0
     failover = 1 if payload.get("failover_enabled", True) else 0
+    # 排班周期：day = 一天一轮（按小时 / 固定时刻表），month = 一月一轮（按天）。
+    # 没传就沿用库里的旧值，别把一月一轮的组顺手改回一天一轮。
+    if "cycle" in payload:
+        cycle = "month" if str(payload.get("cycle") or "").strip() == "month" else "day"
+    else:
+        row = db.query_one("SELECT cycle FROM shift_groups WHERE id=?", (group_id,))
+        cycle = str((row["cycle"] if row else "") or "day")
+    month_cycle = cycle == "month"
     # 域名绑定已经挪到 DNS 页，这里只管老字段：没传就保持原值，别被整表提交清空
     if "ddns_record" in payload:
         ddns_record = str(payload.get("ddns_record") or "").strip()
@@ -666,23 +872,32 @@ def upsert_group(payload: dict[str, Any]) -> int:
             raise ValueError("同一台服务器不能在组里出现两次")
         seen.add(server_id)
         hours = float(item.get("hours") or 0)
-        if hours <= 0 or hours > 168:
+        days = int(item.get("days") or 0)
+        # 一月一轮按天数排，工时只是给界面看的估计值，不参与校验
+        if not month_cycle and (hours <= 0 or hours > 168):
             raise ValueError("每台的运行时长应在 0–168 小时之间")
+        if month_cycle and days < 0:
+            raise ValueError("每台的天数不能是负数")
         slot_name = str(item.get("slot_name") or "").strip()
         start_time = str(item.get("start_time") or "").strip()
         end_time = str(item.get("end_time") or "").strip()
+        if month_cycle:
+            # 按月轮换没有小时边界，起止时刻没有意义，直接清空免得存脏数据
+            start_time = ""
+            end_time = ""
         # 时刻要么都空（走老 hours 累加），要么都填且格式合法
         if (start_time and not end_time) or (end_time and not start_time):
             raise ValueError("班次起止时刻要成对填写")
-        if start_time and not _is_hhmm(start_time):
+        if start_time and not is_hhmm(start_time):
             raise ValueError(f"起始时刻「{start_time}」格式应为 HH:MM")
-        if end_time and not _is_hhmm(end_time):
+        if end_time and not is_hhmm(end_time):
             raise ValueError(f"结束时刻「{end_time}」格式应为 HH:MM")
         members.append(
             {
                 "server_id": server_id,
                 "position": index,
                 "hours": hours,
+                "days": days,
                 "enabled": 1 if item.get("enabled", True) else 0,
                 "slot_name": slot_name,
                 "start_time": start_time,
@@ -692,7 +907,29 @@ def upsert_group(payload: dict[str, Any]) -> int:
 
     if len(members) < 2:
         raise ValueError("换班组至少需要两台服务器")
-    if sum(m["hours"] for m in members if m["enabled"]) <= 0:
+    if month_cycle:
+        # 一个月最多 31 天：合计超过就一定有人整月不上班，保存时就拦住。
+        # 天数全空时按 31 天平摊（除不尽的余数给最后一位），由这里补成具体值。
+        #
+        # 只算启用的成员：停用的成员引擎根本不会给他排日子（active_members 会过滤），
+        # 让他的天数参与校验，就会出现「界面上算出来 1–10 / 11–20 / 21–31，实际只排了
+        # 1–10 / 11–31」这种表里不一。
+        for member in members:
+            if not member["enabled"]:
+                member["days"] = 0
+        live = [m for m in members if m["enabled"]]
+        if any(m["days"] > 0 for m in live) and any(m["days"] <= 0 for m in live):
+            raise ValueError("一月一轮的组，每台启用的成员都要填天数")
+        if live and all(m["days"] <= 0 for m in live):
+            base = max(1, 31 // len(live))
+            for index, member in enumerate(live):
+                member["days"] = base if index < len(live) - 1 else max(1, 31 - base * (len(live) - 1))
+        total_days = sum(m["days"] for m in live)
+        if total_days > 31:
+            raise ValueError(f"合计 {total_days} 天，超过一个月最多 31 天")
+        if total_days <= 0:
+            raise ValueError("至少需要一台启用的成员，且天数大于 0")
+    elif sum(m["hours"] for m in members if m["enabled"]) <= 0:
         raise ValueError("至少需要一台启用的成员，且时长大于 0")
     if enabled:
         conflict = _group_conflict(members, group_id)
@@ -707,39 +944,61 @@ def upsert_group(payload: dict[str, Any]) -> int:
                 raise ValueError("换班组不存在")
             # 成员构成变了就重置轮换起点，避免时序错乱
             old = conn.execute(
-                "SELECT server_id, hours, slot_name, start_time, end_time "
+                "SELECT server_id, hours, days, slot_name, start_time, end_time "
                 "FROM shift_members WHERE group_id=? ORDER BY position",
                 (group_id,),
             ).fetchall()
+            old_cycle = str(
+                (
+                    conn.execute("SELECT cycle FROM shift_groups WHERE id=?", (group_id,)).fetchone()
+                    or {"cycle": "day"}
+                )["cycle"]
+                or "day"
+            )
             old_signature = [
-                (row["server_id"], row["hours"], row["slot_name"], row["start_time"], row["end_time"])
+                (
+                    row["server_id"],
+                    row["hours"],
+                    row["days"],
+                    row["slot_name"],
+                    row["start_time"],
+                    row["end_time"],
+                )
                 for row in old
             ]
             new_signature = [
-                (m["server_id"], m["hours"], m["slot_name"], m["start_time"], m["end_time"])
+                (
+                    m["server_id"],
+                    m["hours"],
+                    m["days"],
+                    m["slot_name"],
+                    m["start_time"],
+                    m["end_time"],
+                )
                 for m in members
             ]
             conn.execute(
-                "UPDATE shift_groups SET name=?, enabled=?, failover_enabled=?, ddns_record=? WHERE id=?",
-                (name, enabled, failover, ddns_record, group_id),
+                "UPDATE shift_groups SET name=?, enabled=?, failover_enabled=?, ddns_record=?, cycle=? "
+                "WHERE id=?",
+                (name, enabled, failover, ddns_record, cycle, group_id),
             )
-            if old_signature != new_signature:
+            if old_signature != new_signature or old_cycle != cycle:
                 conn.execute(
                     "UPDATE shift_groups SET anchor_at=? WHERE id=?", (int(time.time()), group_id)
                 )
             conn.execute("DELETE FROM shift_members WHERE group_id=?", (group_id,))
         else:
             cur = conn.execute(
-                "INSERT INTO shift_groups(name, enabled, failover_enabled, ddns_record, anchor_at, created_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (name, enabled, failover, ddns_record, int(time.time()), int(time.time())),
+                "INSERT INTO shift_groups(name, enabled, failover_enabled, ddns_record, cycle, "
+                "anchor_at, created_at) VALUES(?,?,?,?,?,?,?)",
+                (name, enabled, failover, ddns_record, cycle, int(time.time()), int(time.time())),
             )
             group_id = int(cur.lastrowid or 0)
 
         for member in members:
             conn.execute(
                 "INSERT INTO shift_members(group_id, server_id, position, hours, enabled, "
-                "slot_name, start_time, end_time) VALUES(?,?,?,?,?,?,?,?)",
+                "slot_name, start_time, end_time, days) VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     group_id,
                     member["server_id"],
@@ -749,6 +1008,7 @@ def upsert_group(payload: dict[str, Any]) -> int:
                     member["slot_name"],
                     member["start_time"],
                     member["end_time"],
+                    member["days"],
                 ),
             )
         conn.execute("COMMIT")
@@ -797,20 +1057,28 @@ _HEALTHY_PHASES = ("pending", "switching", "settled", "failover", "manual")
 
 def upsert_run(group_id: int, slot: str, **fields: Any) -> dict[str, Any]:
     now = int(time.time())
-    existing = get_run(group_id, slot)
-    if existing is None:
-        db.execute(
-            "INSERT INTO shift_runs(group_id, slot, started_at, updated_at) VALUES(?,?,?,?)",
-            (group_id, slot, now, now),
-        )
     if str(fields.get("phase") or "") in _HEALTHY_PHASES and "note" not in fields:
         fields["note"] = ""
-    if fields:
-        assignments = ", ".join(f"{key}=?" for key in fields)
-        db.execute(
-            f"UPDATE shift_runs SET {assignments}, updated_at=? WHERE group_id=? AND slot=?",
-            (*fields.values(), now, group_id, slot),
-        )
+    # started_at 是本班次「从什么时候开始处理」的锚点（换班超时按它算）。
+    # 默认只在建行时写一次；抢占恢复那一处会显式传值，表示重新计时。
+    reset_started = "started_at" in fields
+    started_at = int(fields.pop("started_at")) if reset_started else now
+
+    columns = ["group_id", "slot", "started_at", "updated_at", *fields.keys()]
+    values: list[Any] = [group_id, slot, started_at, now, *fields.values()]
+    # 以前是「先 INSERT 再 UPDATE」两条语句，中间崩掉会留一条只有 group_id/slot
+    # 的空 run。合成一条原子 upsert：冲突时只覆盖本次带的字段 + updated_at，
+    # 不动 started_at（每次对账都刷它，换班超时就永远等不到了）。
+    update_keys = [*fields.keys(), "updated_at"]
+    if reset_started:
+        update_keys.insert(0, "started_at")
+    updates = ", ".join(f"{key}=excluded.{key}" for key in update_keys)
+    db.execute(
+        f"INSERT INTO shift_runs({', '.join(columns)}) "
+        f"VALUES({', '.join('?' * len(columns))}) "
+        f"ON CONFLICT(group_id, slot) DO UPDATE SET {updates}",
+        values,
+    )
     return get_run(group_id, slot) or {}
 
 
@@ -858,7 +1126,8 @@ def add_event(
     now = int(time.time())
     event_id = db.insert(
         "INSERT INTO events(ts, level, kind, group_id, server_id, title, detail, "
-        "status, finished_at, pending_status, pending_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "status, finished_at, pending_status, pending_kind, pending_ts) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             now,
             level,
@@ -871,6 +1140,8 @@ def add_event(
             now if status != "running" else 0,
             pending_status if status == "running" else "",
             pending_kind if status == "running" else "",
+            # 等待从这个时刻开始算（与 ts 相同）；retarget_event 改挂目标时会刷新
+            now if status == "running" else 0,
         ),
     )
     if status != "running" and detail:
@@ -893,6 +1164,43 @@ def list_pending_events() -> list[dict[str, Any]]:
     return events
 
 
+def pending_manual_exists(server_id: int, target_status: str) -> bool:
+    """这台机器是否已有一条进行中、待确认到同一目标状态的手动开关机事件。
+
+    用于幂等：手动开关机是异步的（下发指令后由确认器轮询到位），快速连点会
+    重复下发启停指令并产生多条转圈事件，这里在下发前拦一道。
+    """
+    row = db.query_one(
+        "SELECT 1 FROM events WHERE server_id=? AND status='running' "
+        "AND pending_kind='manual' AND pending_status=?",
+        (server_id, target_status),
+    )
+    return row is not None
+
+
+def pending_event(server_id: int, pending_kind: str) -> dict[str, Any] | None:
+    """这台机器还在等确认的那条事件（按类型取最新一条），没有返回 None。
+
+    单机保活重试开机时用它复用同一条事件追加进度：一台机器一直起不来，
+    不该每次重试都新开一条「保活拉起」。
+    """
+    row = db.query_one(
+        "SELECT * FROM events WHERE server_id=? AND status='running' "
+        "AND pending_kind=? ORDER BY id DESC LIMIT 1",
+        (server_id, pending_kind),
+    )
+    return dict(row) if row else None
+
+
+def running_pending_events(pending_kind: str) -> list[dict[str, Any]]:
+    """所有「进行中」且带指定 pending_kind 的事件（读取告警的收尾清理用）。"""
+    rows = db.query(
+        "SELECT * FROM events WHERE status='running' AND pending_kind=? ORDER BY id",
+        (pending_kind,),
+    )
+    return [dict(row) for row in rows]
+
+
 # 单个事件最多保留的进度条数，超出丢弃最旧的，防止长期卡住的事件把进度撑爆
 PROGRESS_MAX_STEPS = 50
 
@@ -907,25 +1215,40 @@ def add_event_progress(event_id: int, text: str, *, once: bool = False) -> None:
     """
     if not event_id:
         return
-    now = int(time.time())
-    row = db.query_one("SELECT progress FROM events WHERE id=?", (event_id,))
+    # 读-改-写放进锁内：确认线程与对账线程会同时追加同一条事件的进度，无锁时
+    # 两个线程都读到旧进度、各自 append 后覆盖写，后写者把先写者的进度挤掉。
+    with _event_lock:
+        now = int(time.time())
+        row = db.query_one("SELECT progress FROM events WHERE id=?", (event_id,))
+        if row is None:
+            return
+        try:
+            progress = json.loads(row["progress"] or "[]")
+        except Exception:
+            progress = []
+        if progress and progress[-1].get("text") == text:
+            return
+        if once and any(step.get("text") == text for step in progress):
+            return
+        progress.append({"ts": now, "text": text})
+        if len(progress) > PROGRESS_MAX_STEPS:
+            progress = progress[-PROGRESS_MAX_STEPS:]
+        db.execute(
+            "UPDATE events SET progress=? WHERE id=?",
+            (json.dumps(progress, ensure_ascii=False), event_id),
+        )
+
+
+def get_event(event_id: int) -> dict[str, Any] | None:
+    """取单条事件（含 progress）。查不到返回 None。"""
+    if not event_id:
+        return None
+    row = db.query_one("SELECT * FROM events WHERE id=?", (int(event_id),))
     if row is None:
-        return
-    try:
-        progress = json.loads(row["progress"] or "[]")
-    except Exception:
-        progress = []
-    if progress and progress[-1].get("text") == text:
-        return
-    if once and any(step.get("text") == text for step in progress):
-        return
-    progress.append({"ts": now, "text": text})
-    if len(progress) > PROGRESS_MAX_STEPS:
-        progress = progress[-PROGRESS_MAX_STEPS:]
-    db.execute(
-        "UPDATE events SET progress=? WHERE id=?",
-        (json.dumps(progress, ensure_ascii=False), event_id),
-    )
+        return None
+    event = dict(row)
+    event["progress"] = _parse_progress(event.get("progress"))
+    return event
 
 
 def finish_event(event_id: int, status: str = "done", detail: str = "") -> None:
@@ -938,13 +1261,18 @@ def finish_event(event_id: int, status: str = "done", detail: str = "") -> None:
         sets.append("detail=?")
         params.append(detail)
     params.append(event_id)
-    db.execute(f"UPDATE events SET {', '.join(sets)} WHERE id=?", params)
+    # 只收尾「进行中」的事件：确认线程与对账线程可能同时 finish 同一条事件，
+    # 加条件避免后到者把已收尾事件的状态/详情再覆盖一次（如 done 被改回 error）。
+    db.execute(
+        f"UPDATE events SET {', '.join(sets)} WHERE id=? AND status='running'",
+        params,
+    )
 
 
 def update_event(
-    event_id: int, *, title: str = "", detail: str = "", kind: str = ""
+    event_id: int, *, title: str = "", detail: str = "", kind: str = "", level: str = ""
 ) -> None:
-    """改写一条事件的标题 / 摘要 / 类型（如「换班进行中」→「换班完成」），保留原 ts 与进度。"""
+    """改写一条事件的标题 / 摘要 / 类型 / 级别（如「换班进行中」→「换班完成」），保留原 ts 与进度。"""
     if not event_id:
         return
     sets: list[str] = []
@@ -958,10 +1286,47 @@ def update_event(
     if kind:
         sets.append("kind=?")
         params.append(kind)
+    if level:
+        sets.append("level=?")
+        params.append(level)
     if not sets:
         return
     params.append(event_id)
     db.execute(f"UPDATE events SET {', '.join(sets)} WHERE id=?", params)
+
+
+def retarget_event(event_id: int, pending_status: str, pending_kind: str) -> None:
+    """把一条还在转的事件改成「等另一个目标状态」。
+
+    典型场景：保活拉起事件转到一半，运行窗口关了 —— 它等的 Running 已经没意义，
+    应当改等 Stopped（停机到位再收尾），而不是就地写一句「已暂停」了事。
+
+    pending_ts 一起刷新：超时按「开始等这个目标」的时刻算。这条事件可能已经转了
+    几小时（机器一直起不来），沿用原来的 ts 会让确认器下一轮直接把新目标判成
+    「超时未确认」—— 停机指令刚下发就报失败，过程和结果全丢了。
+    """
+    if not event_id:
+        return
+    db.execute(
+        "UPDATE events SET pending_status=?, pending_kind=?, pending_ts=? WHERE id=?",
+        (pending_status, pending_kind, int(time.time()), event_id),
+    )
+
+
+def running_events(group_id: int, kinds: tuple[str, ...]) -> list[dict[str, Any]]:
+    """这个组里还挂着「进行中」的事件（按类型筛）。
+
+    用于防止流程被覆盖后留下一条永远转圈的旧事件。
+    """
+    if not kinds:
+        return []
+    placeholders = ",".join("?" * len(kinds))
+    rows = db.query(
+        f"SELECT * FROM events WHERE group_id=? AND status='running' "
+        f"AND kind IN ({placeholders}) ORDER BY id DESC",
+        (int(group_id), *kinds),
+    )
+    return [dict(row) for row in rows]
 
 
 def list_events(
@@ -986,6 +1351,44 @@ def list_events(
     return events
 
 
+def latest_event_id(kind: str, group_id: int = 0, max_age: int = 3600) -> int:
+    """最近一条某类事件的 ID，用来给「已经记过的事件」补一条收尾进度。
+
+    超限停机是两轮完成的：先记「已强制节省停机」，等实例真停稳了下一轮才发报告。
+    报告那一步要追加到前一轮那条事件上，这里按类型 + 换班组取最近一条；
+    加个时间窗，免得停用很久之后重新超限时写到一条陈年事件上。
+    """
+    sql = "SELECT id FROM events WHERE kind=? AND ts>=?"
+    params: list[Any] = [kind, int(time.time()) - max_age]
+    if group_id:
+        sql += " AND group_id=?"
+        params.append(group_id)
+    sql += " ORDER BY id DESC LIMIT 1"
+    row = db.query_one(sql, params)
+    return int(row["id"]) if row else 0
+
+
+def latest_server_event(
+    server_id: int, kinds: tuple[str, ...], max_age: int = 600
+) -> dict[str, Any] | None:
+    """某台机器最近一条指定类型的事件，用来把后到的结果补回已收尾的事件。
+
+    单机保活出窗口是两轮完成的：确认器先收尾「单机保活暂停」，巡检下一轮才真正
+    下发停机。要更新的是那条已经 done 的事件，`pending_event()` 只找 running 的，
+    所以单独给一个按 server + kind 取的查询。max_age 同样防写到陈年事件上。
+    """
+    if not kinds:
+        return None
+    placeholders = ",".join("?" for _ in kinds)
+    params: list[Any] = [server_id, *kinds, int(time.time()) - max_age]
+    row = db.query_one(
+        f"SELECT * FROM events WHERE server_id=? AND kind IN ({placeholders}) AND ts>=? "
+        "ORDER BY id DESC LIMIT 1",
+        tuple(params),
+    )
+    return dict(row) if row else None
+
+
 def _parse_progress(raw: str) -> list[dict[str, Any]]:
     if not raw:
         return []
@@ -999,7 +1402,10 @@ def _parse_progress(raw: str) -> list[dict[str, Any]]:
 def prune_events(days: int) -> None:
     now = int(time.time())
     cutoff = now - days * 86400
-    db.execute("DELETE FROM events WHERE ts<?", (cutoff,))
+    # 还在 running 的事件不删：保活 / 换班事件本来就允许跨天，一台机器持续起不来
+    # （长期欠费 / 长期无库存）时，事件可以合法地挂上十几天；按 ts 一刀切会把它
+    # 在界面上凭空删掉，「已尝试 N 次」也从 1 重新数。
+    db.execute("DELETE FROM events WHERE ts<? AND status<>'running'", (cutoff,))
     # flags 里既有 per-slot 的一次性去重键，也有「已让位」「已熔断」这类长期状态，
     # 统一按 90 天兜底清理，别跟着事件保留期一起删
     db.execute("DELETE FROM flags WHERE created_at<?", (now - max(days, 90) * 86400,))
