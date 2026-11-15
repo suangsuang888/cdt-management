@@ -1,5 +1,8 @@
 export type SiteType = 'china' | 'international'
 
+/** 停机模式：节省停机（不计规格费）/ 普通停机（照常收规格费） */
+export type StopMode = 'StopCharging' | 'Stop'
+
 /** 服务器被哪个自动化流程托管；null 表示闲散机器，可随时手动开关机 */
 export type Managed = {
   kind: 'keepalive' | 'group'
@@ -70,6 +73,9 @@ export type Server = {
   traffic_used: number | null
   traffic_percent: number | null
   instance_status: string
+  /** 实例设置里选的停机模式：StopCharging 节省停机 / Stop 普通停机 */
+  stop_mode: StopMode
+  /** 阿里云返回的真实停机模式（选了节省停机但规格不支持时会是 KeepCharging） */
   stopped_mode: string
   public_ip: string
   traffic_checked_at: number
@@ -86,8 +92,17 @@ export type Keepalive = {
   server_id: number
   enabled: boolean
   created_at: number
+  /** 每天允许运行的时段（HH:MM，不跨零点）；空串 = 全天 */
+  start_time: string
+  end_time: string
+  /** 每月允许运行的日子（1–31，不跨月）；0 = 全月 */
+  start_day: number
+  end_day: number
+  /** 当前是否落在运行窗口内（后端按同一套判定算好）；没设窗口时恒为 true */
+  in_window?: boolean
   label: string
   instance_status: string
+  stop_mode?: StopMode
   stopped_mode: string
   public_ip: string
   traffic_used: number | null
@@ -105,6 +120,10 @@ export type ShiftMember = {
   server_id: number
   position: number
   hours: number
+  /** 一月一轮：本月该成员连上多少天（0 = 没排上，历史超额数据才会出现） */
+  days: number
+  /** 这一班怎么写：月模式「1–15 日」、时刻表「08:00–20:00」；空串＝按小时累加 */
+  span_label: string
   enabled: boolean
   is_duty: boolean
   /** 班次名称，如「白班」「夜班」 */
@@ -120,6 +139,8 @@ export type ShiftGroup = {
   name: string
   enabled: boolean
   failover_enabled: boolean
+  /** 排班周期：day = 一天一轮（按小时 / 固定时刻），month = 一月一轮（按天） */
+  cycle: 'day' | 'month'
   ddns_record: string
   anchor_at: number
   cycle_hours: number
@@ -129,6 +150,9 @@ export type ShiftGroup = {
   next_switch_at: number
   phase: string
   phase_label: string
+  /** 实时状态：按「实际状态 vs 排班表」判出来的，界面徽章用它而不是 phase */
+  state: string
+  state_label: string
   note: string
   updated_at: number
   current_index: number
@@ -154,6 +178,12 @@ export type EventItem = {
 export type Overview = {
   now: string
   now_ts: number
+  /** 后端时区下的「YYYY-MM-DD HH:MM」，页面头直接显示，不在前端二次格式化 */
+  now_label: string
+  /** 后端时区下的今天，YYYY-MM-DD */
+  today: string
+  /** 今天所在月份的天数：一月一轮的平摊、"本月 N 天" 都读它 */
+  month_days: number
   timezone: string
   version: string
   brand: string
@@ -176,6 +206,7 @@ export type Settings = {
   timezone: string
   traffic_threshold_pct: string
   reconcile_interval: string
+  reconcile_offset: string
   billing_enabled: boolean
   billing_interval: string
   daily_report_enabled: boolean
@@ -252,6 +283,7 @@ export function emptyServer(): Server {
     traffic_used: null,
     traffic_percent: null,
     instance_status: 'Unknown',
+    stop_mode: 'StopCharging',
     stopped_mode: '',
     public_ip: '',
     traffic_checked_at: 0,
