@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "cdt-management"
-VERSION = "1.1.10"
+VERSION = "1.3.22"
 
 DATA_DIR = Path(os.environ.get("CDT_DATA_DIR", "./data")).resolve()
 DB_PATH = DATA_DIR / "cdt-management.db"
@@ -36,6 +36,38 @@ EVENT_RETAIN_DAYS = max(1, int(os.environ.get("CDT_EVENT_RETAIN_DAYS", "14")))
 
 # 换班超时（分钟）：超时仍未就绪判定为换班异常
 SHIFT_TIMEOUT_MINUTES = max(2, int(os.environ.get("CDT_SHIFT_TIMEOUT_MINUTES", "10")))
+
+# 当班被抢占后「尝试几次仍拉不起来」才做故障转移，换一台顶这一班。
+# 判据是**次数**，不是墙钟：巡检间隔可配（CDT_RECONCILE_INTERVAL，最小 30 秒），
+# 按固定秒数算的话，间隔调成 5 分钟就变成「试 1 次就换人」、调成 30 秒又变成
+# 试 6 次，和说明里写的「尝试 3 次无法拉起」对不上。次数只统计真正下发过
+# start_instance 的那些轮（卡在启动中的轮次不会再下发，不计数）。
+DUTY_START_TRIES = max(2, int(os.environ.get("CDT_DUTY_START_TRIES", "3")))
+
+# 当班迟迟起不来的容忍秒数 —— 现在只用于**中间态兜底**：
+# 实例停在 Starting / Pending 时不会再下发启动指令、次数不涨，只能按时间判死。
+# 不能设太短：竞价实例冷启动本身就要几十秒，太短会把「慢」当成「死」。
+DUTY_STALL_SECONDS = max(60, int(os.environ.get("CDT_DUTY_STALL_SECONDS", "180")))
+
+# 当班已经进入 Starting / Pending（启动指令下发成功、阿里云正在拉机器）时的
+# 额外宽限。这个阶段不是「没起来」，而是「正在起」：Windows 实例正常开机就要
+# 2–3 分钟，拿 180 秒去卡它，等于把正常的慢启动判成起不来，换人之后还会把
+# 正在启动的原当班主动停机 —— 白启动一次。
+#
+# 取 480（8 分钟）而不是 600：换班超时默认就是 10 分钟，两者相等时，一台真正
+# 卡死的机器会在同一轮同时触发「故障转移」和「换班超时」两条通知。提前 2 分钟
+# 先转移，用户先看到「换人了」，超时那条就不会再来添乱。
+#
+# 但换班超时是可配的（CDT_SHIFT_TIMEOUT_MINUTES）。用户调到 8 分钟以下时，
+# 固定的 480 秒就会反超，变成「先超时报警、后转移」。所以这里跟着它收紧：
+# 宽限至少比超时早 60 秒，同时不低于「确实没在跑」的判定阈值。
+_GRACE_CONFIGURED = max(60, int(os.environ.get("CDT_DUTY_START_GRACE", "480")))
+DUTY_START_GRACE = max(
+    DUTY_STALL_SECONDS,
+    min(_GRACE_CONFIGURED, SHIFT_TIMEOUT_MINUTES * 60 - 60),
+)
+# 超时设得比 stall 阈值还短（最小 2 分钟）时，顺序无法再靠宽限修正。
+GRACE_ORDER_BROKEN = DUTY_START_GRACE >= SHIFT_TIMEOUT_MINUTES * 60
 
 # dry-run：不调真实阿里云接口，用于本地 UI 调试
 DRY_RUN = os.environ.get("CDT_DRY_RUN", "0") == "1"
