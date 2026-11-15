@@ -13,6 +13,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import type { DnsRecord, DnsState, Keepalive, Server, ShiftGroup } from '../types'
+import { timeAgo } from '../time'
 import { Badge, Empty, type Tone } from './ui'
 
 type Props = {
@@ -51,13 +52,10 @@ function decode(value: string): { kind: string; id: number } {
   return { kind, id: Number(id) }
 }
 
-function timeAgo(ts: number): string {
+/** 上次同步时间：文案「还没有同步过」是本页特有的，时间基准仍走后端时钟 */
+function lastSyncText(ts: number): string {
   if (!ts) return '还没有同步过'
-  const diff = Math.floor(Date.now() / 1000) - ts
-  if (diff < 60) return '刚刚'
-  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
-  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
-  return new Date(ts * 1000).toLocaleDateString('zh-CN')
+  return timeAgo(ts)
 }
 
 export default function DNSView({
@@ -97,14 +95,15 @@ export default function DNSView({
       return
     }
     const [moved] = next.splice(from, 1)
-    next.splice(to, 0, moved)
+    // 与实例列表同一处偏移：向下拖要减一，否则会插到目标后面。
+    next.splice(from < to ? to - 1 : to, 0, moved)
     setDragRecord(null)
     setOverRecord(null)
     onReorder(next)
   }
 
   const keepaliveIds = new Set(keepalives.map((item) => item.server_id))
-  // 第一项是「所有服务器」全量清单，下面两个大项只是同一批机器的不同视角（快捷入口）：
+  // 第一项是「所有实例」全量清单，下面两个大项只是同一批机器的不同视角（快捷入口）：
   // 换班组会接管机器，所以这些机器不再重复出现在「单机保活」里。
   const groupedIds = new Set(
     groups.flatMap((group) => group.members.map((member) => member.server_id)),
@@ -278,16 +277,17 @@ export default function DNSView({
                     id={`bind-${record.record}`}
                     className="select"
                     value={encode(record)}
+                    disabled={working}
                     onChange={(event) => {
                       const { kind, id } = decode(event.target.value)
                       onBind(record.record, kind, id)
                     }}
                   >
                     <option value="">不绑定（这条记录不会被动）</option>
-                    {/* 第一项：所有服务器，全量铺开（顺序沿用「服务器」页里的手动排序）。
+                    {/* 第一项：所有实例，全量铺开（顺序沿用「实例管理」页里的手动排序）。
                         记录名不稀缺，随便哪台机器都能挂一条域名，不必先编进保活或换班组。 */}
                     {servers.length > 0 && (
-                      <optgroup label="所有服务器">
+                      <optgroup label="所有实例">
                         {servers.map((server) => (
                           <option key={`all-${server.id}`} value={`server:${server.id}`}>
                             {server.label}
@@ -346,7 +346,7 @@ export default function DNSView({
                       </>
                     )}
                   </span>
-                  <span className="dns-time">{timeAgo(record.last_at)}</span>
+                  <span className="dns-time">{lastSyncText(record.last_at)}</span>
                   {record.last_status && record.state === 'error' && (
                     <span className="dns-error">{record.last_status}</span>
                   )}
