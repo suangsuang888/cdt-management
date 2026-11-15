@@ -27,6 +27,7 @@ A = {
     "public_ip": "198.51.100.1",
     "region_id": "cn-hongkong",
     "quota_gb": 200,
+    "threshold_gb": 188,
     "traffic_used": 12.0,
     "instance_status": "Running",
     "stopped_mode": "Not-applicable",
@@ -37,6 +38,7 @@ B = {
     "public_ip": "198.51.100.2",
     "region_id": "cn-hongkong",
     "quota_gb": 200,
+    "threshold_gb": 188,
     "traffic_used": 190.0,
     "instance_status": "Stopped",
     "stopped_mode": "StopCharging",
@@ -47,6 +49,7 @@ C = {
     "public_ip": "198.51.100.3",
     "region_id": "cn-hongkong",
     "quota_gb": 200,
+    "threshold_gb": 188,
     "traffic_used": 5.0,
     "instance_status": "Stopped",
     "stopped_mode": "StopCharging",
@@ -56,7 +59,7 @@ C = {
 class ShiftDone(unittest.TestCase):
     def test_two_members_exactly_like_script(self):
         expected = (
-            "✅ <b>CDT 换班完成报告</b>\n"
+            "✅ <b>CDT 换班完成报告（换班组）</b>\n"
             "\n"
             f"🕒 <b>当前班次</b>：AM\n"
             f"{SEP}\n"
@@ -78,18 +81,22 @@ class ShiftDone(unittest.TestCase):
         )
         message = messages.shift_done(A, [B], "AM", "✅ 已同步")
         self.assertEqual(message.html, expected)
-        self.assertEqual(message.title, "CDT 换班完成报告")
+        self.assertEqual(message.title, "CDT 换班完成报告（换班组）")
 
     def test_delayed_title(self):
         message = messages.shift_done(A, [B], "PM", "✅ 已同步", delayed=True)
-        self.assertTrue(message.html.startswith("✅ <b>CDT 换班成功报告 (延迟恢复)</b>\n\n"))
+        self.assertTrue(
+            message.html.startswith("✅ <b>CDT 换班成功报告（换班组，延迟恢复）</b>\n\n")
+        )
         self.assertIn(f"🕒 <b>当前班次</b>：PM\n{SEP}", message.html)
 
     def test_manual_switch_title(self):
-        """手动换班的报告靠标题后缀区分：内容与自动换班一致，不能写成故障转移。"""
+        """手动换班的报告用独立事件名「手动换班完成」，正文与自动换班一致。"""
         message = messages.shift_done(A, [B], "AM", "✅ 已同步", group_name="港新联合", manual=True)
-        self.assertEqual(message.title, "CDT 港新联合 换班完成报告(手动换班)")
-        self.assertTrue(message.html.startswith("✅ <b>CDT 港新联合 换班完成报告(手动换班)</b>\n\n"))
+        self.assertEqual(message.title, "CDT 手动换班完成报告（换班组：港新联合）")
+        self.assertTrue(
+            message.html.startswith("✅ <b>CDT 手动换班完成报告（换班组：港新联合）</b>\n\n")
+        )
         self.assertNotIn("故障转移", message.html)
         # 正文和自动换班完全一致，只是标题不同
         auto = messages.shift_done(A, [B], "AM", "✅ 已同步", group_name="港新联合")
@@ -110,11 +117,16 @@ class ShiftDone(unittest.TestCase):
         self.assertEqual(messages.shift_period("白班", "06:00", "18:00"), "白班（06:00–18:00）")
         self.assertEqual(messages.shift_period("", "06:00", "18:00"), "06:00–18:00")
 
-    def test_period_marks_next_day(self):
-        # 跨天班次写「次日」，否则 22:00–06:00 看着像时间倒流
+    def test_period_shows_midnight_as_24(self):
+        # 结束 00:00 是「当天到午夜」，显示成 24:00 才不会读成第二天凌晨
         self.assertEqual(
-            messages.shift_period("夜班", "22:00", "06:00"),
-            "夜班（22:00–次日 06:00）",
+            messages.shift_period("白班", "12:00", "00:00"),
+            "白班（12:00–24:00）",
+        )
+        # 起始就是 0 点的那一段照常写 00:00
+        self.assertEqual(
+            messages.shift_period("凌晨班", "00:00", "06:00"),
+            "凌晨班（00:00–06:00）",
         )
 
     def test_stopped_block_uses_real_mode(self):
@@ -136,6 +148,16 @@ class ShiftDone(unittest.TestCase):
         self.assertIn("均已普通停机", message.html)
         self.assertNotIn("均已节省停机", message.html)
 
+    def test_stop_tail_unknown_mode_never_prints_dash(self):
+        # _mode 读不到模式时给的是「-」，以前会拼出「均已-」这种车祸；
+        # 有机器读不到就退成「均已停机」，不能替它猜「节省停机」
+        unknown = {"label": "C1", "instance_id": "i-ccc333", "instance_status": "Stopped"}
+        self.assertEqual(messages.stop_tail([unknown]), "均已停机")
+        self.assertEqual(messages.stop_tail([{**unknown, "stopped_mode": ""}]), "均已停机")
+        message = messages.breaker([{**unknown, "traffic_used": 200.0}])
+        self.assertNotIn("均已-", message.html)
+        self.assertIn("均已停机", message.html)
+
     def test_not_applicable_shown_as_normal_stop(self):
         # Not-applicable = 本实例不支持停机不收费，停机后照常收费，语义等同普通停机，
         # 不能原样漏成英文 Not-applicable
@@ -153,13 +175,15 @@ class ShiftDone(unittest.TestCase):
         self.assertNotIn("已用", messages.shift_done(A, [B], "AM", "✅ 已同步").html)
 
     def test_group_name_in_title(self):
-        # 标题插入组名；单机保活等无组名场景保持脚本原样
+        # 标题带组名 + 全角范围括号；不传组名时退回「（换班组）」
         message = messages.shift_done(A, [B], "AM", "✅ 已同步", group_name="主力组")
-        self.assertTrue(message.html.startswith("✅ <b>CDT 主力组 换班完成报告</b>\n\n"))
-        self.assertEqual(message.title, "CDT 主力组 换班完成报告")
-        # 不传组名时保持原样
+        self.assertTrue(
+            message.html.startswith("✅ <b>CDT 换班完成报告（换班组：主力组）</b>\n\n")
+        )
+        self.assertEqual(message.title, "CDT 换班完成报告（换班组：主力组）")
+        # 不传组名时退回通用范围
         plain = messages.shift_done(A, [B], "AM", "✅ 已同步")
-        self.assertEqual(plain.title, "CDT 换班完成报告")
+        self.assertEqual(plain.title, "CDT 换班完成报告（换班组）")
 
 
 class DdnsStatus(unittest.TestCase):
@@ -170,14 +194,14 @@ class DdnsStatus(unittest.TestCase):
         self.assertIn("┃ ☁️ DDNS：⏸ 未绑定", message.html)
 
     def test_disabled_is_shown_verbatim(self):
-        message = messages.shift_done(A, [B], "AM", "⏸ DDNS 未启用")
-        self.assertIn("┃ ☁️ DDNS：⏸ DDNS 未启用", message.html)
+        message = messages.shift_done(A, [B], "AM", "⏸ 未启用")
+        self.assertIn("┃ ☁️ DDNS：⏸ 未启用", message.html)
 
 
 class ShiftFailover(unittest.TestCase):
     def test_two_members_exactly_like_script(self):
         expected = (
-            "⚠️ <b>CDT 故障转移报告</b>\n"
+            "⚠️ <b>CDT 故障转移报告（换班组）</b>\n"
             "\n"
             f"📢 <b>故障转移</b>：当班实例流量超限，已启用备用实例。\n"
             f"{SEP}\n"
@@ -220,10 +244,11 @@ class Breaker(unittest.TestCase):
 
     def test_two_members_wording(self):
         message = messages.breaker([self.OFF_A, B])
-        self.assertTrue(message.html.startswith("🚨 <b>CDT 全局熔断报告</b>\n\n"))
+        self.assertTrue(message.html.startswith("🚨 <b>CDT 全局熔断报告（换班组）</b>\n\n"))
         self.assertIn("⚠ <b>警告：双实例流量均已到达到阈值，“全局熔断”，均已节省停机。</b>", message.html)
         self.assertIn(
-            "🖥 AliCloud-CDT-AM\n┃ 📦 实例：<code>i-aaa111</code>\n┃ 📍 地域：中国香港\n┃ 📈 已用：12.00 GB\n",
+            "🖥 AliCloud-CDT-AM\n┃ 📦 实例：<code>i-aaa111</code>\n┃ 🌐 ＩＰ：198.51.100.1\n"
+            "┃ 📍 地域：中国香港\n┃ 📈 已用：12.00 GB（阈值 188 GB）\n",
             message.html,
         )
 
@@ -232,26 +257,64 @@ class Breaker(unittest.TestCase):
         self.assertIn("3 台实例流量均已到达到阈值", message.html)
         self.assertEqual(message.html.count("🖥 "), 3)
 
+    def test_each_block_shows_its_own_threshold(self):
+        """阈值是每台机器自己在设置里填的，不能拿第一台的或组里统一值套。"""
+        html = messages.breaker(
+            [{**self.OFF_A, "threshold_gb": 180}, {**B, "threshold_gb": 150}]
+        ).html
+        self.assertIn("┃ 📈 已用：12.00 GB（阈值 180 GB）", html)
+        self.assertIn("┃ 📈 已用：190.00 GB（阈值 150 GB）", html)
+
+    def test_missing_threshold_omits_parenthesis(self):
+        """没设阈值就别写「阈值 0 GB」，那比不写更误导。"""
+        html = messages.breaker([{**B, "threshold_gb": 0}]).html
+        self.assertIn("┃ 📈 已用：190.00 GB\n", html)
+        self.assertNotIn("（阈值", html)
+
+    def test_block_has_ip_between_instance_and_region(self):
+        """块内字段顺序与其它报告一致：实例 → ＩＰ → 地域 → 已用 → 状态。"""
+        block = messages.breaker([B]).html.split("🖥 ")[1]
+        order = [block.index(k) for k in ("📦 实例", "🌐 ＩＰ", "📍 地域", "📈 已用", "⚪ 状态")]
+        self.assertEqual(order, sorted(order))
+
 
 class OtherReports(unittest.TestCase):
     def test_limit_stop(self):
         expected = (
-            "🚨 <b>CDT 全局熔断报告</b>\n"
+            "🚨 <b>CDT 全局熔断报告（换班组）</b>\n"
             "\n"
-            "当班实例流量超限，已强制节省停机。\n"
+            "当班实例流量超限，该换班组没有启用故障转移，已强制节省停机。\n"
+            "如有需要，请开启故障转移或者去管理后台手动点击“立即换班”。\n"
             "\n"
             "🖥 AliCloud-CDT-PM\n"
             "┃ 📦 实例：<code>i-bbb222</code>\n"
             "┃ 🌐 ＩＰ：198.51.100.2\n"
             "┃ 📍 地域：中国香港\n"
-            "┃ 🔴 状态：Stopped (StopCharging)\n"
+            "┃ 📈 已用：190.00 GB（阈值 188 GB）\n"
+            "┃ ⚪ 状态：Stopped (StopCharging)\n"
             f"{SEP}"
         )
         self.assertEqual(messages.limit_stop(B).html, expected)
 
+    def test_over_limit_keepalive(self):
+        message = messages.over_limit(B, messages.SCOPE_KEEPALIVE)
+        self.assertEqual(message.title, "CDT 超限停机报告（单机保活）")
+        self.assertTrue(
+            message.html.startswith("🚨 <b>CDT 超限停机报告（单机保活）</b>\n\n")
+        )
+        # 停机模式必须写出来：只写「已暂停保活」看不出这台是省钱停了还是照常计费
+        self.assertIn("已节省停机，并暂停保活", message.html)
+        self.assertIn("┃ 📈 已用：190.00 GB（阈值 188 GB）", message.html)
+
+    def test_over_limit_idle(self):
+        message = messages.over_limit(B, messages.SCOPE_IDLE)
+        self.assertEqual(message.title, "CDT 超限停机报告（闲散手动）")
+        self.assertIn("已节省停机", message.html)
+        self.assertNotIn("已暂停保活", message.html)
+
     def test_recovery(self):
         expected = (
-            "🟢 <b>CDT 抢占恢复报告(联合换班)</b>\n"
+            "🟢 <b>CDT 抢占恢复报告（换班组）</b>\n"
             "\n"
             "当班实例疑被抢占，已自动恢复运行。\n"
             "\n"
@@ -267,25 +330,34 @@ class OtherReports(unittest.TestCase):
 
     def test_keepalive_reuses_recovery_layout(self):
         message = messages.recovery(
-            A, "⏸ DDNS 未启用", headline="实例疑被抢占，已自动恢复运行。", kind="keepalive"
+            A, "⏸ 未启用", headline="实例疑被抢占，已自动恢复运行。", kind="keepalive"
         )
-        # 单机保活标题后面挂「(单机保活)」，换班组是「(联合换班)」，
-        # 正文只有第一句不同，其余版式完全一样
+        # 单机保活标题后面挂「（单机保活）」，换班组是「（换班组：组名）」
         self.assertTrue(
             message.html.startswith(
-                "🟢 <b>CDT 抢占恢复报告(单机保活)</b>\n\n实例疑被抢占"
+                "🟢 <b>CDT 抢占恢复报告（单机保活）</b>\n\n实例疑被抢占"
             )
         )
         self.assertEqual(message.kind, "keepalive")
-        self.assertEqual(message.title, "CDT 抢占恢复报告(单机保活)")
+        self.assertEqual(message.title, "CDT 抢占恢复报告（单机保活）")
         self.assertNotIn("当班实例", message.html)
 
+    def test_recovery_group_name(self):
+        message = messages.recovery(A, "✅ 已同步", group_name="港新联合")
+        self.assertEqual(message.title, "CDT 抢占恢复报告（换班组：港新联合）")
+
     def test_shift_error(self):
-        message = messages.shift_error(B, [A], 10)
-        self.assertTrue(message.html.startswith("⚠️ <b>CDT 换班异常报告</b>\n\n"))
+        # duty=B 是 Stopped（该运行没运行 → ⚪），stopped=[A] 是 Running（该停没停 → 🟢）
+        message = messages.shift_error(B, [A], 10, ddns_status="⏸ 目标未运行")
+        self.assertTrue(message.html.startswith("⚠️ <b>CDT 换班异常报告（换班组）</b>\n\n"))
         self.assertIn("⏳ <b>换班超时：换班指令已执行 10 分钟，但状态未就绪。</b>", message.html)
         self.assertIn("🚩 <b>应当运行账号 </b>", message.html)
         self.assertIn("🚩 <b>应当停止账号 </b>", message.html)
+        # 状态图标跟着真实状态走，不再写死 🚧
+        self.assertIn("┃ ⚪ 状态：Stopped (StopCharging)", message.html)
+        self.assertIn("┃ 🟢 状态：Running", message.html)
+        # 域名的状态行：其它换班报告都有，异常报告同样要有（只挂在应当运行那台）
+        self.assertIn("┃ ☁️ DDNS：⏸ 目标未运行", message.html)
 
     def test_every_notification_has_region_line(self):
         # 所有通知的实例块都要跟每日报告一样带「地域」行（IP 下面一行；熔断块没有 IP 行，
@@ -329,15 +401,32 @@ class OtherReports(unittest.TestCase):
         )
 
     def test_daily_report(self):
-        message = messages.daily_report([A, B], "2026-10-26 23:58")
+        a = {
+            **A,
+            "site": "china",
+            "monthly_cost": 12.34,
+            "balance_amount": 1234.56,
+            "billing_currency": "CNY",
+        }
+        b = {
+            **B,
+            "site": "international",
+            "monthly_cost": 3.21,
+            # 国际站后付费账号 AvailableAmount 恒 0，直接显示 $0.00，不再写「后付费」
+            "balance_amount": 0.0,
+            "billing_currency": "USD",
+        }
+        message = messages.daily_report([a, b], "2026-10-26 23:58")
         expected = (
-            "📊 <b>CDT 每日流量报告</b>\n"
+            "📊 <b>CDT-Management 每日报告</b>\n"
             "\n"
             "🖥 AliCloud-CDT-AM\n"
             "┃ 📦 实例：<code>i-aaa111</code>\n"
             "┃ 🌐 ＩＰ：198.51.100.1\n"
             "┃ 📍 地域：中国香港\n"
-            "┃ 📈 已用：12.00 GB\n"
+            "┃ 💰 费用：¥12.34\n"
+            "┃ 💳 余额：¥1234.56\n"
+            "┃ 📈 流量：12.00 GB\n"
             "┃ 💾 剩余：188.00 GB\n"
             "┃ 🔥 使用率：6.00%  🟢 正常\n"
             "\n"
@@ -345,7 +434,9 @@ class OtherReports(unittest.TestCase):
             "┃ 📦 实例：<code>i-bbb222</code>\n"
             "┃ 🌐 ＩＰ：198.51.100.2\n"
             "┃ 📍 地域：中国香港\n"
-            "┃ 📈 已用：190.00 GB\n"
+            "┃ 💰 费用：$3.21\n"
+            "┃ 💳 余额：$0.00\n"
+            "┃ 📈 流量：190.00 GB\n"
             "┃ 💾 剩余：10.00 GB\n"
             "┃ 🔥 使用率：95.00%  🔴 危险\n"
             "\n"
