@@ -35,6 +35,12 @@ CREATE TABLE IF NOT EXISTS servers (
     remark              TEXT    NOT NULL DEFAULT '',
     traffic_used        REAL,
     instance_status     TEXT    NOT NULL DEFAULT '',
+    -- 用户希望的停机模式：StopCharging（节省停机）/ Stop（普通停机）。
+    -- 各模块下发停机指令时都读这个值，不再各自写死「节省停机」。
+    stop_mode           TEXT    NOT NULL DEFAULT 'StopCharging',
+    -- 上一次阿里云返回的**真实**停机模式（StopCharging / KeepCharging / Not-applicable）。
+    -- 与上面那个偏好分开存：选了节省停机但规格不支持时，这里会是 KeepCharging，
+    -- 事件与通知里的「已节省停机 / 已普通停机」必须按它写，否则账单照扣还在说省钱。
     stopped_mode        TEXT    NOT NULL DEFAULT '',
     public_ip           TEXT    NOT NULL DEFAULT '',
     traffic_checked_at  INTEGER NOT NULL DEFAULT 0,
@@ -53,11 +59,19 @@ CREATE TABLE IF NOT EXISTS servers (
     sort_order          INTEGER NOT NULL DEFAULT 0
 );
 
--- 单机保活：只负责「停了就拉起来」，不做换班
+-- 单机保活：负责「停了就拉起来」，可限定运行时段与日期
 CREATE TABLE IF NOT EXISTS keepalives (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     server_id  INTEGER NOT NULL UNIQUE,
     enabled    INTEGER NOT NULL DEFAULT 1,
+    -- 每天允许运行的时段（24 小时循环）：end > start 当天内；end < start 跨天到次日；
+    -- end == start 等于全天；end 填 00:00 且 start 非零表示到 24:00。两项都空 = 全天。
+    start_time TEXT    NOT NULL DEFAULT '',
+    end_time   TEXT    NOT NULL DEFAULT '',
+    -- 每月允许运行的日子：start_day ≤ day ≤ end_day，必须同一个月内（不跨月）。
+    -- 0 = 不限（两项都 0 才是全月，只有一项为 0 视为无效配置）。
+    start_day  INTEGER NOT NULL DEFAULT 0,
+    end_day    INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL DEFAULT 0
 );
 
@@ -69,11 +83,14 @@ CREATE TABLE IF NOT EXISTS shift_groups (
     failover_enabled  INTEGER NOT NULL DEFAULT 1,
     ddns_record       TEXT    NOT NULL DEFAULT '',
     anchor_at         INTEGER NOT NULL DEFAULT 0,
-    created_at        INTEGER NOT NULL DEFAULT 0
+    created_at        INTEGER NOT NULL DEFAULT 0,
+    -- 排班周期：day = 一天一轮（按小时 / 固定时刻表），month = 一月一轮（按天）
+    cycle             TEXT    NOT NULL DEFAULT 'day'
 );
 
 -- 组成员：按 position 顺序轮换。老字段 hours 仍保留（兼容老组），
 -- 新版用「班次名称 + 固定起止时刻」：每天按真实时钟判定谁当班。
+-- cycle=month 的组用 days：本月该成员连上多少天，从 1 号 0 点依次铺开。
 CREATE TABLE IF NOT EXISTS shift_members (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id   INTEGER NOT NULL,
@@ -84,6 +101,7 @@ CREATE TABLE IF NOT EXISTS shift_members (
     slot_name  TEXT    NOT NULL DEFAULT '',
     start_time TEXT    NOT NULL DEFAULT '',
     end_time   TEXT    NOT NULL DEFAULT '',
+    days       INTEGER NOT NULL DEFAULT 0,
     UNIQUE(group_id, position)
 );
 CREATE INDEX IF NOT EXISTS idx_members_group ON shift_members(group_id, position);
@@ -101,12 +119,26 @@ CREATE TABLE IF NOT EXISTS shift_runs (
     duty_server_id      INTEGER NOT NULL DEFAULT 0,
     standby_server_ids  TEXT    NOT NULL DEFAULT '',
     failover            INTEGER NOT NULL DEFAULT 0,
+    -- 故障转移的原因：'traffic'（当班流量超限）/ 'stall'（当班起不来，保活超时）。
+    -- 两者共用同一套状态机，只是事件与通知里的说法不同。
+    failover_reason     TEXT    NOT NULL DEFAULT '',
+    -- 被接管的那台（原当班）的 server_id。结算通知里「被接管账号」那一块靠它取，
+    -- 不能再靠「谁超限」反推 —— 保活超时的原当班根本没超限。
+    failover_from       INTEGER NOT NULL DEFAULT 0,
+    -- 这次「起不来代班」是哪一天生效的（组时区 YYYY-MM-DD）。
+    -- 一月一轮的段长可达整月，代班者一顶就是一整段，把别人的天全吃掉；
+    -- 引擎据此在隔天 0 点把代班清掉、重新请原当班上线（一天一轮不用这个）。
+    duty_day            TEXT    NOT NULL DEFAULT '',
     -- 手动换班标记：1 表示这次当班切换是用户手动触发的，不是流量超限故障转移。
     -- 手动换班界面已反馈，不应再发「流量超限临时换班」的误导通知。
     manual              INTEGER NOT NULL DEFAULT 0,
     -- 本班次的由来：'' 按时刻表正常轮换 / 'new_group' 新建换班组后的首次对齐。
     -- 新建组那一次的事件标题要固定成「组名：新建换班组」，结算时不能改叫「换班完成」。
     origin              TEXT    NOT NULL DEFAULT '',
+    -- 换班开始时各条域名记录指向的 IP（JSON：{记录名: IP}）。
+    -- 换完班把域名指到新当班机之后，事件里的「DDNS：…」那一步要写清楚
+    -- 「旧 IP → 新 IP」；靠这里存的开班前快照算，否则中途巡检先同步掉就丢了旧值。
+    dns_before          TEXT    NOT NULL DEFAULT '',
     attempts            INTEGER NOT NULL DEFAULT 0,
     started_at          INTEGER NOT NULL DEFAULT 0,
     updated_at          INTEGER NOT NULL DEFAULT 0,
@@ -153,13 +185,20 @@ CREATE TABLE IF NOT EXISTS events (
     pending_status TEXT    NOT NULL DEFAULT '',
     -- 异步事件类型：manual（手动开关机）/ keepalive（保活拉起）。确认器据此
     -- 决定到位后是否补发通知（保活到位要发「抢占恢复」）
-    pending_kind   TEXT    NOT NULL DEFAULT ''
+    pending_kind   TEXT    NOT NULL DEFAULT '',
+    -- 开始等待「当前」目标状态的时刻。超时按它算，不能用 ts：一条保活事件可能
+    -- 已经转了几小时（机器一直起不来），窗口到点被改挂「等停机」后 ts 还是老的，
+    -- 按 ts 算会立刻判成「超时未确认」，事件收尾变成假失败。
+    pending_ts     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
 
 CREATE TABLE IF NOT EXISTS flags (
     key        TEXT PRIMARY KEY,
-    created_at INTEGER NOT NULL DEFAULT 0
+    created_at INTEGER NOT NULL DEFAULT 0,
+    -- 一次性标记的附带数值。目前只有保活重试用它记「这是第几次尝试」：
+    -- 一台机器躺一整天，事件只有一条，界面上那句「已重试 N 次」就靠它累加。
+    value      INTEGER NOT NULL DEFAULT 0
 );
 
 -- 已注销的会话票据（只存票据签名的 SHA-256 前 16 字节，不存票据本身）。
@@ -189,6 +228,10 @@ DEFAULTS: dict[str, str] = {
     "timezone": "Asia/Shanghai",
     "traffic_threshold_pct": "90",
     "reconcile_interval": str(settings.RECONCILE_INTERVAL),
+    # 每轮巡检对齐到「每 N 秒网格」里的第几秒触发（0–59）。
+    # 大量保活脚本默认都在第 0 秒打阿里云接口，错开几秒能少挤一点；
+    # 默认 0，与加上这个设置项之前的行为完全一致。
+    "reconcile_offset": "0",
     # 费用/余额查询：需要 RAM 具备 BSS 只读权限，缺权限时关掉即可不显示
     "billing_enabled": "1",
     "billing_interval": "600",
@@ -269,11 +312,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "billing_updated_at": "INTEGER NOT NULL DEFAULT 0",
             "billing_error": "TEXT NOT NULL DEFAULT ''",
             "sort_order": "INTEGER NOT NULL DEFAULT 0",
+            "stop_mode": "TEXT NOT NULL DEFAULT 'StopCharging'",
         },
         "shift_members": {
             "slot_name": "TEXT NOT NULL DEFAULT ''",
             "start_time": "TEXT NOT NULL DEFAULT ''",
             "end_time": "TEXT NOT NULL DEFAULT ''",
+            "days": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "shift_groups": {
+            "cycle": "TEXT NOT NULL DEFAULT 'day'",
         },
         "events": {
             "status": "TEXT NOT NULL DEFAULT 'done'",
@@ -281,15 +329,29 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "finished_at": "INTEGER NOT NULL DEFAULT 0",
             "pending_status": "TEXT NOT NULL DEFAULT ''",
             "pending_kind": "TEXT NOT NULL DEFAULT ''",
+            "pending_ts": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "keepalives": {
+            "start_time": "TEXT NOT NULL DEFAULT ''",
+            "end_time": "TEXT NOT NULL DEFAULT ''",
+            "start_day": "INTEGER NOT NULL DEFAULT 0",
+            "end_day": "INTEGER NOT NULL DEFAULT 0",
         },
         "shift_runs": {
             "stage": "TEXT NOT NULL DEFAULT ''",
             "event_id": "INTEGER NOT NULL DEFAULT 0",
             "manual": "INTEGER NOT NULL DEFAULT 0",
             "origin": "TEXT NOT NULL DEFAULT ''",
+            "dns_before": "TEXT NOT NULL DEFAULT ''",
+            "failover_reason": "TEXT NOT NULL DEFAULT ''",
+            "failover_from": "INTEGER NOT NULL DEFAULT 0",
+            "duty_day": "TEXT NOT NULL DEFAULT ''",
         },
         "dns_records": {
             "sort_order": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "flags": {
+            "value": "INTEGER NOT NULL DEFAULT 0",
         },
     }
     for table, columns in additions.items():
@@ -301,6 +363,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # 老库上 idx_dns_target 是「一个目标只能占一条记录」的 UNIQUE 索引，
     # 现在一个目标可以挂多条域名，必须把它拆掉，否则第二条绑不上。
     conn.execute("DROP INDEX IF EXISTS idx_dns_target")
+
+    # 老库里还在转的事件没有 pending_ts（新列默认 0）：补成创建时刻，等价于
+    # 升级前的行为（超时按 ts 算），不会因为升级把在跑的事件一次性判超时。
+    conn.execute("UPDATE events SET pending_ts=ts WHERE pending_ts=0 AND status='running'")
 
 
 def init_db() -> None:
