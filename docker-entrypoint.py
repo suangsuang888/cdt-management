@@ -103,14 +103,22 @@ def _children(root: Path, deep: bool) -> Iterator[str]:
 
 
 def drop_privileges(uid: int, gid: int) -> None:
-    """丢掉 root，之后进程再想提权也提不回来。"""
+    """丢掉 root，之后进程再想提权也提不回来。
+
+    在 Orkestr 这类去掉全部 capabilities 的平台上，root 也没有 CAP_SETGID，
+    setgid/setuid 会报 PermissionError。降权失败时记一句日志、继续以当前
+    身份运行，而不是让整个容器启动失败。
+    """
     try:
         os.setgroups([])
     except OSError:
         # 没权限清附加组时会失败，不影响主流程
         pass
-    os.setgid(gid)
-    os.setuid(uid)
+    try:
+        os.setgid(gid)
+        os.setuid(uid)
+    except OSError as exc:
+        log(f"降权到 {uid}:{gid} 失败（{exc}），以当前身份继续运行")
 
 
 def probe_writable(path: Path) -> bool:
@@ -183,8 +191,9 @@ def main() -> int:
             log(f"{data_dir} 的属主已调整为 {uid}:{gid}（扫了{scope}，改动 {changed} 个条目）")
         drop_privileges(uid, gid)
         if os.getuid() != uid:
-            log(f"降权失败，当前仍是 uid {os.getuid()}")
-            return 1
+            # 降权失败也不中止：Orkestr 这类平台不给 CAP_SETGID，
+            # 容器以当前身份继续跑，后面还有可写性探测兜底。
+            log(f"降权失败，当前仍是 uid {os.getuid()}，以当前身份继续运行")
     else:
         who = f"uid {os.getuid()}" if POSIX else "非 POSIX 环境（本地调试）"
         log(f"以 {who} 运行，跳过属主调整")
