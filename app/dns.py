@@ -16,9 +16,10 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
-from . import ddns, repo
+from . import ddns, messages, repo
 
 log = logging.getLogger("cdt-management.dns")
 
@@ -27,6 +28,10 @@ TARGET_GROUP = "group"
 TARGET_NONE = ""
 
 STATUS_UNBOUND = "⏸ 未绑定"
+# 概览摘要里统一带「DDNS」前缀（`✅ DDNS已同步（…）` / `⏸ DDNS未绑定`），
+# 事件列表收起时那一行能直接看出是哪一项没绑；详情和通知仍用短句。
+STATUS_UNBOUND_BRIEF = "⏸ DDNS未绑定"
+STATUS_DISABLED_BRIEF = "⏸ DDNS未启用"
 STATUS_IDLE = "⏸ 目标未运行"
 STATUS_NO_IP = "⚠️ 目标没有公网 IP"
 
@@ -35,6 +40,30 @@ STATE_IDLE = "idle"
 STATE_PENDING = "pending"
 STATE_SYNCED = "synced"
 STATE_ERROR = "error"
+
+# 一条记录同步失败后，这么多秒内不再重试。
+# `ddns.sync` 内部本身就有多次重试，多条坏记录会让每分钟的对账被拖成几十秒；
+# 失败原因（❌/⚠️）已经写在记录上，冷却期内界面上照样看得见，不需要反复打接口。
+_RETRY_COOLDOWN = 120
+
+# 中间态：机器在动（正在起来/正在停），别急着判「没在跑」
+_TRANSIENT_STATUS = {"Starting", "Pending", "Stopping"}
+
+
+@dataclass
+class DDNSReport:
+    """一次同步的三个说法，各用各的场合。
+
+    detail  事件详情里的一行：带前后 IP，能看出到底改没改
+    brief   事件概览/收尾摘要：一句话结论
+    status  原来的汇总状态（✅ 已同步 / ❌ 更新失败…），**通知里用它**，
+            保持和以前一样简洁，不夹带「已更新/未变化」
+    """
+
+    detail: str
+    brief: str
+    status: str
+    results: list[ddns.DDNSResult] = field(default_factory=list)
 
 
 def normalize(name: str | None) -> str:
@@ -47,6 +76,15 @@ def normalize(name: str | None) -> str:
 
 def sync_registry(config: dict[str, str]) -> None:
     """把设置里的记录名同步进表里，设置里删掉的就从表里删掉。"""
+    # 配置读不懂（不是列表、或混了非域名）时绝不能往下走：下面那段会把
+    # 「不在名单里」的行连同 target 一起删光，用户从此不再有 DDNS。
+    # 注意区分「读不懂」(None) 和「用户清空」(空列表)：后者该删就删。
+    if ddns.parse_records(config) is None:
+        log.warning(
+            "DDNS 记录名配置无法解析，保留现有绑定不动：%r",
+            (config.get("ddns_records") or "")[:80],
+        )
+        return
     names = ddns.records(config)
     keep = set(names)
     for name in names:
@@ -75,6 +113,18 @@ def adopt_legacy(config: dict[str, str]) -> None:
         log.info("接手换班组「%s」的域名 %s", group.get("name"), legacy)
 
 
+def _editable_records(config: dict[str, str]) -> list[str]:
+    """加/删记录时用来当基底的旧列表。
+
+    这两个入口都是「读出旧列表 → 改一项 → 整体写回」。基底若因为配置读不懂而
+    退化成空列表，写回就等于把其它域名连同绑定一起删了 —— 所以读不懂时直接拒绝，
+    让用户先把 ddns_records 修好。
+    """
+    if ddns.parse_records(config) is None:
+        raise ValueError("记录名配置读不懂（ddns_records 不是合法列表），请先修好再改")
+    return ddns.records(config)
+
+
 def add_record(name: str, config: dict[str, str]) -> str:
     name = normalize(name)
     if not name:
@@ -84,7 +134,7 @@ def add_record(name: str, config: dict[str, str]) -> str:
     if "." not in name:
         raise ValueError("域名至少要有一层，形如 cdt.example.com")
 
-    names = ddns.records(config)
+    names = _editable_records(config)
     if name.lower() not in {item.lower() for item in names}:
         names.append(name)
     repo.set_settings(
@@ -100,7 +150,7 @@ def add_record(name: str, config: dict[str, str]) -> str:
 
 def remove_record(name: str, config: dict[str, str]) -> None:
     name = normalize(name)
-    names = [item for item in ddns.records(config) if item.lower() != name.lower()]
+    names = [item for item in _editable_records(config) if item.lower() != name.lower()]
     repo.set_settings(
         {
             "ddns_records": json.dumps(names, ensure_ascii=False),
@@ -119,20 +169,21 @@ def _servers() -> dict[int, dict[str, Any]]:
 
 
 def _group_runner(group_id: int, now_ts: float, servers: dict[int, dict[str, Any]]) -> dict[str, Any] | None:
-    """换班组此刻真正在跑哪台。故障转移过的班次以运行记录为准，跟界面高亮保持一致。"""
+    """换班组此刻真正在跑哪台。
+
+    故障转移、人工换班都会让「实际当班」不同于时钟排出来的那台，统一交给
+    shift.actual_duty 判定 —— 以前这里只认 failover，手动换完班域名框还挂在
+    已经停机的那台机器卡片上（用户截图里的现象）。
+    """
     from . import shift  # 延迟导入：shift 反过来要用本模块，顶层导入会成环
 
     group = repo.get_group(group_id)
     if group is None:
         return None
-    picked = shift.duty_at(group, now_ts)
+    picked = shift.actual_duty(group, now_ts)
     if not picked:
         return None
-    server_id = int(picked[0]["server_id"])
-    run = repo.get_run(group_id, str(picked[1])) or {}
-    if run.get("failover") and int(run.get("duty_server_id") or 0):
-        server_id = int(run["duty_server_id"])
-    return servers.get(server_id)
+    return servers.get(int(picked[0]["server_id"]))
 
 
 def target_info(
@@ -207,6 +258,10 @@ def state_of(row: dict[str, Any], target: dict[str, Any] | None) -> str:
         return STATE_UNBOUND
     live = desired_ip(target)
     if not live:
+        # 「在跑但公网 IP 还没拿到」（EIP 还没绑上 / 刚启动）跟「没在跑」是两件事：
+        # 以前都判成 idle，界面写「目标未运行」，人看着像机器挂了，实际马上就绪。
+        if target.get("running") or str(target.get("status") or "") in _TRANSIENT_STATUS:
+            return STATE_PENDING
         return STATE_IDLE
     last = str(row.get("last_ip") or "")
     status = str(row.get("last_status") or "")
@@ -228,10 +283,14 @@ def sync_record(
     config: dict[str, str],
     ip: str | None = None,
     force: bool = False,
+    verify: bool = False,
 ) -> ddns.DDNSResult:
     """把某条记录同步到它该指向的 IP。
 
     ip 留空时自己算（目标没在跑就不同步）。换班/保活那边已经知道 IP，直接传进来。
+
+    verify=True 时去 Cloudflare 查一次真实值再决定要不要改（开机/换班这些关键时刻）；
+    默认 False 走本地缓存判断，巡检对账不会因此多打请求。
     """
     record = normalize(record)
     if not record:
@@ -239,6 +298,12 @@ def sync_record(
     row = repo.get_dns_record(record)
     if row is None:
         return ddns.DDNSResult(STATUS_UNBOUND, f"{record} 不在记录名列表里")
+
+    if ip is not None and not ip:
+        # 调用方明确给了空 IP（实例刚起、EIP 还没分配）：这一轮不同步，也**不要**
+        # 按失败把 last_status 覆盖成「IP 无效」——上次的「✅ 已同步」还要留着，
+        # 下一轮拿到真实 IP 再改。以前空串会一路走到 ddns.sync，界面开始报假异常。
+        return ddns.DDNSResult(STATUS_NO_IP, "实例还没有可用的公网 IP", ip="")
 
     if ip is None:
         target = target_info(row.get("target_kind") or "", int(row.get("target_id") or 0))
@@ -257,15 +322,37 @@ def sync_record(
         "ddns_last_ip": row.get("last_ip") or "",
         "ddns_last_status": row.get("last_status") or "",
     }
-    result = ddns.sync(ip, scoped, force=force, record=record)
+    result = ddns.sync(ip, scoped, force=force, record=record, verify=verify)
     if result.status in (ddns.STATUS_SYNCED, ddns.STATUS_UNCHANGED):
-        repo.set_dns_state(record, ip, result.status)
+        # IP 和状态都没变就别写库。last_at 的语义是「上次真正同步的时间」，
+        # 不是「上次检查的时间」：换班引擎每轮结算都会来问一次（IP 未变时
+        # ddns.sync 直接返回 UNCHANGED，一个请求都不发），无条件写库会让界面
+        # 永远显示「刚刚」，看着像解析被每分钟改写一遍，实际啥也没干。
+        # force=True（手动「立即同步」）例外：用户点了按钮，时间戳就得动。
+        unchanged = (row.get("last_ip") or "") == ip and (
+            row.get("last_status") or ""
+        ) == result.status
+        if force or not unchanged:
+            # verify 查完发现 CF 上本来就对：这是「纠正本地缓存」，不是真的写过
+            # Cloudflare，时间戳得留着，否则界面又会跳到「刚刚」，跟事件里
+            # 「IP 未变化」自相矛盾。
+            keep_at = None
+            if verify and not force and not result.changed:
+                keep_at = row.get("last_at") or None
+            repo.set_dns_state(record, ip, result.status, at=keep_at)
         # 成功后清掉失败去重标记（含手动「立即同步」这条路径），
         # 否则下一次真失败时会被历史标记压住，界面不再提醒
         repo.clear_flags_like(f"dns_fail:{record}:")
     else:
-        # 失败时保留上次成功的 IP：界面上「现在解析到哪」要能看出来是旧的
-        repo.set_dns_state(record, row.get("last_ip") or "", result.status)
+        # 失败时保留上次成功的 IP **与时间**：「现在解析到哪」「上次真同步是什么
+        # 时候」都得能看出来是旧的。以前不传 at，last_at 被刷成当前时刻，界面显示
+        # 「刚刚」但状态是失败，跟事件里的原因自相矛盾。
+        repo.set_dns_state(
+            record,
+            row.get("last_ip") or "",
+            result.status,
+            at=int(row.get("last_at") or 0),
+        )
     return result
 
 
@@ -280,12 +367,31 @@ def combine_status(statuses: list[str]) -> str:
     return " / ".join(unique)
 
 
+def sync_target_full(
+    kind: str,
+    target_id: int,
+    config: dict[str, str],
+    ip: str | None = None,
+    force: bool = False,
+    verify: bool = False,
+) -> tuple[list[str], list[ddns.DDNSResult]]:
+    """同 sync_target，但把每条记录的完整结果带回来（详情要写前后 IP）。"""
+    names = repo.dns_records_of(kind, int(target_id or 0))
+    if not names:
+        return [], []
+    results = [
+        sync_record(name, config, ip=ip, force=force, verify=verify) for name in names
+    ]
+    return names, results
+
+
 def sync_target(
     kind: str,
     target_id: int,
     config: dict[str, str],
     ip: str | None = None,
     force: bool = False,
+    verify: bool = False,
 ) -> tuple[list[str], list[str]]:
     """把这个目标绑定的**全部**记录同步一遍，返回 (记录名列表, 每条的状态列表)。
 
@@ -293,11 +399,126 @@ def sync_target(
     换班组同理，轮到谁当班就把它绑的每一条都指过去。
     文案用 combine_status() 汇总，多个目标合并同步时也能把状态拼在一起。
     """
-    names = repo.dns_records_of(kind, int(target_id or 0))
-    if not names:
-        return [], []
-    statuses = [sync_record(name, config, ip=ip, force=force).status for name in names]
-    return names, statuses
+    names, results = sync_target_full(
+        kind, target_id, config, ip=ip, force=force, verify=verify
+    )
+    return names, [result.status for result in results]
+
+
+def report(names: list[str], results: list[ddns.DDNSResult]) -> DDNSReport:
+    """一次同步的三种说法：详情（前后 IP）、概览（改没改）、通知（保持简洁）。
+
+    概览按用户的写法固定成「✅ DDNS已同步（已更新）」/「（IP 未变化）」；
+    通知仍用 status（`✅ 已同步`），不夹带括号说明，保持短。
+    """
+    if not results:
+        return DDNSReport(STATUS_UNBOUND, STATUS_UNBOUND_BRIEF, STATUS_UNBOUND, [])
+
+    status = combine_status([result.status for result in results])
+    # 有失败就照旧把原因摆出来，不包装成「已同步（…）」
+    if not is_success(status):
+        return DDNSReport(status, status, status, results)
+
+    changed = [result for result in results if result.changed]
+    if len(changed) == len(results):
+        brief = "✅ DDNS已同步（已更新）"
+    elif not changed:
+        brief = "✅ DDNS已同步（IP 未变化）"
+    else:
+        brief = (
+            f"✅ DDNS已同步（已更新 {len(changed)} 条 / "
+            f"未变化 {len(results) - len(changed)} 条）"
+        )
+
+    multi = len(names) > 1
+    parts: list[str] = []
+    for index, result in enumerate(results):
+        name = names[index] if index < len(names) else ""
+        prefix = f"{name} " if multi and name else ""
+        if result.changed:
+            # 第一次指向没有「旧值」，写成「首次指向」比留一个空箭头清楚
+            parts.append(
+                f"{prefix}{result.previous} → {result.ip}"
+                if result.previous
+                else f"{prefix}{result.ip}（首次指向）"
+            )
+        else:
+            parts.append(f"{prefix}{result.ip}（IP 未变化）")
+
+    detail = f"{ddns.STATUS_SYNCED} " + "、".join(parts)
+    return DDNSReport(detail, brief, status, results)
+
+
+def no_sync_report(config: dict[str, str]) -> DDNSReport:
+    """这一步没有可同步的东西时的统一说法：DDNS 关着 → 未启用，开着没绑 → 未绑定。
+
+    事件概览里 DDNS 那一段必须始终在：「运行中」和「运行中 / ✅ DDNS已同步（…）」
+    两种形状混在一个列表里，用户分不清是没绑域名还是漏写了。这里只拼文案，
+    不碰记录状态、不打接口 —— DDNS 关着时更不能走 sync_record，它会顺手把
+    记录的 last_status 刷成「未启用」，DNS 页开始报假状态。
+    """
+    if config.get("ddns_enabled") != "1":
+        return DDNSReport(
+            ddns.STATUS_DISABLED, STATUS_DISABLED_BRIEF, ddns.STATUS_DISABLED, []
+        )
+    return DDNSReport(STATUS_UNBOUND, STATUS_UNBOUND_BRIEF, STATUS_UNBOUND, [])
+
+
+# 换班进行中，巡检让位多久（秒）。
+# 换班本身最多 10 分钟就该结算完（超时会报「换班超时」），这里给到 15 分钟：
+# 正常换班全程由结算统一写解析；真要卡死（非当班一直停不下来），超过这个时长
+# 就由巡检接手，不能让域名长期指着已经停掉的旧机器。
+_SHIFT_DNS_HOLD = 15 * 60
+
+
+def _shift_events(kind: str, target_id: int) -> list[dict[str, Any]]:
+    """这个目标身上还挂着哪些「进行中」的换班事件。"""
+    if not target_id:
+        return []
+    from . import shift  # 延迟导入：shift 反过来要用本模块
+
+    if kind == TARGET_GROUP:
+        group_ids = [int(target_id)]
+    elif kind == TARGET_SERVER:
+        # 这台机器自己绑的域名，换班时也会被一起指过去
+        group_ids = shift.groups_of_server(int(target_id))
+    else:
+        return []
+    # failover / shift_failover：当班超限或起不来时，事件 kind 会在转移过程中
+    # 被改写成这两个。漏掉它们，转移期间巡检会以为「没在换班」，抢在换班事件
+    # 之前单独把域名指过去，还多记一条 DNS 事件。
+    kinds = ("shift_done", "manual", "group_new", "failover", "shift_failover")
+    events: list[dict[str, Any]] = []
+    for group_id in group_ids:
+        events.extend(repo.running_events(group_id, kinds))
+    return events
+
+
+def _shift_busy(kind: str, target_id: int) -> bool:
+    """这个目标是不是正处在一次换班里（换班事件自己会记 DDNS 那一步）。
+
+    换班过程中当班机的 IP 变了，巡检也会发现「解析对不上」并同步。这次同步的结果
+    不该再单开一条「xxx：解析已更新」事件 —— 用户点开换班事件时看到旁边还挂着
+    一条 DNS 事件，读不出两者是一次操作。此时交给换班事件在「DDNS：…」那一步里
+    写清楚前后 IP（由 report() 按 Cloudflare 的实际值生成）。
+    """
+    return bool(_shift_events(kind, target_id))
+
+
+def _shift_hold(kind: str, target_id: int, now_ts: float | None = None) -> bool:
+    """换班还在进行、且没有卡死：这一刻巡检**不要动解析**。
+
+    只压事件是不够的。巡检抢在结算前把记录改动，结算那一轮去 Cloudflare 一看
+    「已经对了」，事件里只能写「IP 未变化」—— 域名明明刚跟着机器换过，用户看到
+    的却像没动（1.3.8 把这句话加进概览之后，一眼就能看出不对劲）。
+    所以换班期间解析一律留给结算去改：它按 Cloudflare 的真实值决定改不改，并把
+    「旧 IP → 新 IP」写进详情。超过 _SHIFT_DNS_HOLD 视为换班卡死，巡检接手。
+    """
+    events = _shift_events(kind, target_id)
+    if not events:
+        return False
+    now = time.time() if now_ts is None else now_ts
+    return any(now - float(event.get("ts") or 0) < _SHIFT_DNS_HOLD for event in events)
 
 
 def reconcile(config: dict[str, str], force: bool = False) -> list[dict[str, Any]]:
@@ -326,6 +547,16 @@ def reconcile(config: dict[str, str], force: bool = False) -> list[dict[str, Any
             continue
         if not force and live == (row.get("last_ip") or "") and (row.get("last_status") or "").startswith("✅"):
             continue
+        # 刚失败过的记录先冷静一会儿：坏记录（记录名被删、Token 过期）每轮都重试
+        # 只会把 60 秒的巡检拖长。手动「立即同步」force=True，不受此限。
+        if not force:
+            cooled = repo.flag_age(f"dns_retry:{record}")
+            if 0 <= cooled < _RETRY_COOLDOWN:
+                continue
+            # 换班进行中（且没卡死）：解析交给换班结算统一改。抢在结算前同步的话，
+            # 结算去 Cloudflare 核对时值已经对了，事件只能写「IP 未变化」。
+            if _shift_hold(kind, int(row.get("target_id") or 0), now_ts):
+                continue
 
         previous = row.get("last_ip") or ""
         result = sync_record(record, config, ip=live, force=force)
@@ -333,15 +564,16 @@ def reconcile(config: dict[str, str], force: bool = False) -> list[dict[str, Any
             {"record": record, "target": target.get("label"), "ip": live, "status": result.status}
         )
         if result.status in (ddns.STATUS_SYNCED, ddns.STATUS_UNCHANGED):
+            repo.clear_flag(f"dns_retry:{record}")
             # 这次成功了就把这条记录历史上所有失败标记清掉。
             # 以前只清「当前这种失败」的标记，换一种失败方式时旧的告警标记永远留着，
             # 同一类失败第二次出现就不再提醒了。注意要在「IP 变了」分支之前清，
             # 否则恢复后的第一次成功走的正是那条路，标记留在原地。
             repo.clear_flags_like(f"dns_fail:{record}:")
-            if previous != live:
+            if previous != live and not _shift_busy(kind, int(row.get("target_id") or 0)):
                 repo.add_event(
                     "dns",
-                    f"{record}：解析已更新",
+                    messages.ev("DNS 记录已更新", messages.obj_server(record)),
                     f"{previous or '—'} → {live}（{target.get('label')}）",
                 )
         else:
@@ -351,10 +583,16 @@ def reconcile(config: dict[str, str], force: bool = False) -> list[dict[str, Any
                 repo.set_flag(flag)
                 repo.add_event(
                     "error",
-                    f"{record}：{result.status}",
+                    messages.ev(result.status, messages.obj_server(record)),
                     result.detail or target.get("label") or "",
                     level="warning",
                 )
+            # 冷却计时从现在开始：这段时间内不再为这条记录打接口。
+            # set_flag 是 ON CONFLICT DO NOTHING，必须先清再置：否则 created_at
+            # 停在**第一次**失败的时刻，120 秒后判定永远过期，每轮巡检都重试，
+            # 注释承诺的冷却等于只生效一次。
+            repo.clear_flag(f"dns_retry:{record}")
+            repo.set_flag(f"dns_retry:{record}")
     return results
 
 
@@ -362,7 +600,7 @@ def reconcile(config: dict[str, str], force: bool = False) -> list[dict[str, Any
 # 绑定
 # --------------------------------------------------------------------------
 
-def bind(record: str, kind: str, target_id: int) -> dict[str, Any]:
+def bind(record: str, kind: str, target_id: int, config: dict[str, str] | None = None) -> dict[str, Any]:
     record = normalize(record)
     if record == "":
         raise ValueError("域名不能为空")
@@ -387,11 +625,32 @@ def bind(record: str, kind: str, target_id: int) -> dict[str, Any]:
     target = target_info(kind, int(target_id))
     label = (target or {}).get("label") or f"#{target_id}"
     records = repo.dns_records_of(kind, int(target_id))
-    detail = f"{record} → {label}"
+    result: dict[str, Any] = {"record": record, "target": target, "records": records}
+
+    # 绑完立刻同步一次：用户刚把域名指到这台机器/这个换班组，不该等到下一轮
+    # 巡检（最长一分钟）才生效。目标没在跑就只写状态，不硬塞 IP。
+    synced: ddns.DDNSResult | None = None
+    if config is not None and config.get("ddns_enabled") == "1":
+        synced = sync_record(record, config)
+        result["sync"] = {"status": synced.status, "detail": synced.detail, "ip": synced.ip}
+
+    # 概览和详情统一带「DDNS」：概览用 brief（✅ DDNS已同步（已更新）），
+    # 详情写带前后 IP 的那一行，与换班结算、保活拉起、手动开机同一套写法。
+    # 以前写「绑定后立即同步：✅ 已同步」，列表里这一条和其他事件对不上。
+    summary = f"已指向 {label}"
     if len(records) > 1:
-        detail += f"（该目标现有 {len(records)} 条记录）"
-    repo.add_event("dns", "DNS 绑定已更新", detail)
-    return {"record": record, "target": target, "records": records}
+        summary += f"（该目标现有 {len(records)} 条记录）"
+    synced_report = report([record], [synced]) if synced is not None else None
+    if synced_report is not None:
+        summary += f" / {synced_report.brief}"
+    # detail 留空：一次性事件会把 detail 按行拆成过程条目，这里概览和过程要分开写
+    # —— 概览是「已指向 X / ✅ DDNS已同步（…）」，过程第一步只写「已指向 X」。
+    event_id = repo.add_event("dns", messages.ev("DNS 绑定已更新", record), "")
+    repo.add_event_progress(event_id, f"已指向 {label}")
+    if synced_report is not None:
+        repo.add_event_progress(event_id, f"DDNS：{synced_report.detail}")
+    repo.update_event(event_id, detail=summary)
+    return result
 
 
 # --------------------------------------------------------------------------
