@@ -67,14 +67,21 @@ export function statusLabel(status: string, mode?: string | null) {
   return detail ? `${base} · ${detail}` : base
 }
 
-export function phaseTone(phase: string): Tone {
-  if (phase === 'settled') return 'green'
-  if (phase === 'failover') return 'amber'
-  if (phase === 'manual') return 'blue'
-  if (phase === 'breaker') return 'red'
-  if (phase === 'error') return 'red'
-  if (phase === 'switching') return 'blue'
+/** 换班组徽章配色：正常绿、故障转移黄、手动换班 / 换班中蓝、熔断与异常红、其余灰 */
+export function groupStateTone(state: string): Tone {
+  if (state === 'scheduled') return 'green'
+  if (state === 'failover') return 'amber'
+  if (state === 'recovering') return 'amber'
+  if (state === 'manual') return 'blue'
+  if (state === 'switching') return 'blue'
+  if (state === 'breaker') return 'red'
+  if (state === 'error') return 'red'
   return 'gray'
+}
+
+/** 只在「正在动」的状态上闪，静态状态闪起来像在报警 */
+export function groupStatePulse(state: string): boolean {
+  return state === 'switching' || state === 'recovering'
 }
 
 /* -------------------------------------------------------------- 环形进度 */
@@ -85,18 +92,20 @@ export function Ring({
   stroke = 4,
   tone = 'accent',
   children,
+  title,
 }: {
   percent: number
   size?: number
   stroke?: number
   tone?: 'accent' | 'amber' | 'red' | 'blue'
   children?: ReactNode
+  title?: string
 }) {
   const safe = Math.max(0, Math.min(100, Number.isFinite(percent) ? percent : 0))
   const radius = (size - stroke) / 2
   const circumference = 2 * Math.PI * radius
   return (
-    <div className={`ring ${tone}`} style={{ width: size, height: size }}>
+    <div className={`ring ${tone}`} style={{ width: size, height: size }} title={title}>
       <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden="true">
         <circle
           className="ring-track"
@@ -126,21 +135,69 @@ export function Ring({
 
 /* -------------------------------------------------------------- 流量条 */
 
-export function Meter({ used, quota, threshold }: { used: number | null; quota: number; threshold: number }) {
-  const percent = used === null ? 0 : Math.min(100, (used / (quota || 1)) * 100)
-  const thresholdPercent = Math.min(100, (threshold / (quota || 1)) * 100)
-  const tone = percent >= thresholdPercent ? 'danger' : percent >= thresholdPercent * 0.9 ? 'warn' : ''
+export function Meter({
+  used,
+  quota,
+  threshold,
+  compact = false,
+}: {
+  used: number | null
+  quota: number
+  threshold: number
+  /** 紧凑模式：只报「已用 + 百分比」，阈值只留刻度线，给列表行那种窄列用 */
+  compact?: boolean
+}) {
+  // 分母只认配额（后端默认每台 200GB），和通知、概览流量圈一个口径；
+  // 阈值只用来定颜色和那条刻度线，不参与百分比。
+  const base = quota > 0 ? quota : 200
+  const rawPercent = used === null ? 0 : (used / base) * 100
+  // 进度条画到 100% 就顶格，但标签照报真实值（超配额时能读到 103.4%，别糊成 100.0%）
+  const percent = Math.min(100, rawPercent)
+  const thresholdPercent = Math.min(100, (threshold / base) * 100)
+  const tone = rawPercent >= thresholdPercent ? 'danger' : rawPercent >= thresholdPercent * 0.9 ? 'warn' : ''
+  const trackRef = useRef<HTMLDivElement>(null)
+  const markRef = useRef<HTMLElement>(null)
+
+  // 阈值刻度线必须落在整像素上：百分比定位落在亚像素位置时，浏览器按设备像素
+  // 对齐后有的卡片只压住 1 列像素、有的压住 2 列，看起来就是「一边细一边粗」。
+  // 轨道宽度差零点几像素就会触发（415px 与 416px 的 90% 落在不同相位），所以
+  // 这里量出轨道的绝对位置，把刻度线的**页面坐标**取整，再减去轨道自身的小数偏移
+  // ——只按轨道内部取整还不够，轨道本身起点在小数像素上时照样会糊。
+  useEffect(() => {
+    const track = trackRef.current
+    const mark = markRef.current
+    if (!track || !mark) return
+    const snap = () => {
+      const rect = track.getBoundingClientRect()
+      if (!rect.width) return
+      const target = rect.left + (thresholdPercent / 100) * rect.width
+      const snapped = Math.round(target)
+      // CSS 里 margin-left: -1px 让 2px 宽的线以 left 为中心，这里补回那 1px
+      mark.style.left = `${snapped - rect.left + 1}px`
+    }
+    snap()
+    const observer = new ResizeObserver(snap)
+    observer.observe(track)
+    return () => observer.disconnect()
+  }, [thresholdPercent])
+
   return (
-    <div className="meter">
-      <div className="meter-track" title={`阈值线 ${thresholdPercent.toFixed(0)}%`}>
+    <div
+      className={`meter${compact ? ' is-compact' : ''}`}
+      title={
+        compact
+          ? `已用 ${used === null ? '未读取' : `${used.toFixed(2)} GB`} / 配额 ${base} GB · 阈值 ${threshold} GB`
+          : undefined
+      }
+    >
+      <div className="meter-track" ref={trackRef} title={`阈值线 ${thresholdPercent.toFixed(0)}%`}>
         <div className={`meter-fill ${tone}`} style={{ width: `${percent}%` }} />
-        <i className="meter-mark" style={{ left: `${thresholdPercent}%` }} />
+        {/* 内联百分比只是首帧兜底，挂载后由上面那段 effect 改成整像素 */}
+        <i className="meter-mark" ref={markRef} style={{ left: `${thresholdPercent}%` }} />
       </div>
       <div className="meter-labels">
         <span>{used === null ? '未读取' : `${used.toFixed(2)} GB`}</span>
-        <span>
-          {percent.toFixed(1)}% / 阈值 {threshold} GB
-        </span>
+        <span>{compact ? `${rawPercent.toFixed(1)}%` : `${rawPercent.toFixed(1)}% / 阈值 ${threshold} GB`}</span>
       </div>
     </div>
   )
@@ -258,6 +315,25 @@ export function Modal({
       </div>
     </div>
   )
+}
+
+/* -------------------------------------------------------------- 金额 */
+
+const CURRENCY_SIGN: Record<string, string> = {
+  CNY: '¥',
+  USD: '$',
+  HKD: 'HK$',
+  JPY: 'JP¥',
+  EUR: '€',
+  GBP: '£',
+}
+
+/** 金额展示统一走这里：实例卡片与概览的实例状态卡读的是同一份 BSS 快照，
+ *  各写一份格式化会出现「¥1.42」和「1.42 元」两种写法 */
+export function money(value: number | null, currency: string): string {
+  if (value === null || Number.isNaN(value)) return '—'
+  const sign = CURRENCY_SIGN[currency] ?? `${currency} `
+  return `${sign}${value.toFixed(2)}`
 }
 
 /* -------------------------------------------------------------- 空状态 */
