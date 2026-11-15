@@ -143,14 +143,14 @@ class NewGroupBootstrap(_Base):
         event = events[0]
         self.assertEqual(event["kind"], "group_new")
         self.assertEqual(event["status"], "done")
-        self.assertEqual(event["title"], "整队组：新建换班组")
+        self.assertEqual(event["title"], "新建换班组（换班组：整队组）")
 
         texts = [step["text"] for step in event["progress"]]
         self.assertTrue(any(t.startswith("按排班表核对组员状态") for t in texts), texts)
         # 核对阶段就点出哪台不符合，用户不用等动作下发完
         self.assertTrue(any("需要开机" in t for t in texts), texts)
         self.assertTrue(any("需要节省停机" in t for t in texts), texts)
-        self.assertEqual(sum("已下发启动当班" in t for t in texts), 1, texts)
+        self.assertEqual(sum("已下发开机指令" in t for t in texts), 1, texts)
         self.assertEqual(sum("已下发停机" in t for t in texts), 1, texts)
         # DDNS 排在停机之后：状态没全部到位不碰域名
         ddns_at = next(i for i, t in enumerate(texts) if t.startswith("DDNS："))
@@ -166,7 +166,7 @@ class NewGroupBootstrap(_Base):
         for _ in range(5):
             self._reconcile(self.group_id)
         titles = [e["title"] for e in self._events(self.group_id)]
-        self.assertEqual(titles, ["整队组：新建换班组"], titles)
+        self.assertEqual(titles, ["新建换班组（换班组：整队组）"], titles)
 
     def test_disabled_group_only_records_event(self):
         repo.upsert_group(
@@ -185,9 +185,35 @@ class NewGroupBootstrap(_Base):
         self.assertEqual(result.get("skipped"), "disabled")
         self.assertEqual(_status(self.b)[0], "Running")  # 原样不动
         event = self._events(self.group_id)[0]
-        self.assertEqual(event["title"], "整队组：新建换班组")
+        self.assertEqual(event["title"], "新建换班组（换班组：整队组）")
         self.assertEqual(event["status"], "done")
         self.assertIn("未启用", event["detail"])
+
+    def test_disabled_group_closes_running_event(self):
+        """组停用：正在转的换班事件要收尾，不能永久停在「换班进行中」。"""
+        running_id = repo.add_event(
+            "shift_done",
+            "换班进行中（换班组：整队组）",
+            "等待当班 整队A 到位",
+            group_id=self.group_id,
+            status="running",
+        )
+        repo.upsert_group(
+            {
+                "id": self.group_id,
+                "name": "整队组",
+                "enabled": False,
+                "failover_enabled": True,
+                "members": [
+                    {"server_id": self.a, "hours": 12},
+                    {"server_id": self.b, "hours": 12},
+                ],
+            }
+        )
+        self._reconcile(self.group_id)
+        event = [e for e in self._events(self.group_id) if e["id"] == running_id][0]
+        self.assertEqual(event["status"], "error", event)
+        self.assertIn("停用", event["detail"])
 
 
 class DissolveGroup(_Base):
@@ -239,7 +265,9 @@ class DissolveGroup(_Base):
         event = events[0]
         self.assertEqual(event["kind"], "group_dissolve")
         self.assertEqual(event["status"], "done")
-        self.assertEqual(event["title"], "解散组：解散换班组")
+        self.assertEqual(event["title"], "解散换班组（换班组：解散组）")
+        # 概览也要说清域名被解绑了，不能只在步骤里写
+        self.assertIn("DDNS 绑定已解除", event["detail"], event["detail"])
         texts = [step["text"] for step in event["progress"]]
         self.assertTrue(any("解散A" in t and "保持不动" in t for t in texts), texts)
         self.assertTrue(any("解散B" in t and "保持不动" in t for t in texts), texts)
