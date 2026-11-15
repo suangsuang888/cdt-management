@@ -10,6 +10,7 @@ import {
   HeartPulse,
   Info,
   Loader2,
+  MapPin,
   Repeat,
   Server as ServerIcon,
   ShieldAlert,
@@ -20,7 +21,10 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import type { EventItem, Overview } from '../types'
-import { Badge, Meter, Ring, phaseTone, statusLabel, statusTone } from './ui'
+import { clockText, timeAgo } from '../time'
+import { regionLabel } from '../regions'
+import { ownerBase, ownerLabel } from '../owners'
+import { Badge, Empty, Meter, Ring, money, statusLabel, statusTone } from './ui'
 
 const EVENT_ICON: Record<string, typeof Info> = {
   shift_done: Zap,
@@ -36,24 +40,15 @@ const EVENT_ICON: Record<string, typeof Info> = {
   daily_report: Gauge,
   stop: CloudOff,
   start: Cloud,
+  // 单机保活的窗口相关事件：暂停 / 恢复 / 计划内拉起，图标要与「抢占恢复」区分开
+  keepalive_pause: CloudOff,
+  keepalive_resume: Cloud,
+  keepalive_quiet: Cloud,
+  keepalive_rest_error: AlertTriangle,
 }
 
-function timeAgo(ts: number): string {
-  if (!ts) return '—'
-  const diff = Math.floor(Date.now() / 1000) - ts
-  if (diff < 60) return '刚刚'
-  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
-  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
-  return new Date(ts * 1000).toLocaleDateString('zh-CN')
-}
-
-function clock(ts: number): string {
-  if (!ts) return '—'
-  return new Date(ts * 1000).toLocaleTimeString('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
+/** 事件列表默认露这么多条，点一次「显示更多事件」再加这么多（后端最多给 20 条） */
+const RECENT_EVENT_PAGE = 8
 
 export default function DashboardView({
   overview,
@@ -62,11 +57,22 @@ export default function DashboardView({
   overview: Overview
   onNavigate: (view: 'servers' | 'keepalive' | 'shift') => void
 }) {
+  // 后端一次给最近 20 条，先露 8 条，剩下的点「显示更多事件」再展开
+  const [eventCount, setEventCount] = useState(RECENT_EVENT_PAGE)
   const running = overview.servers.filter((server) => server.instance_status === 'Running').length
   const totalTraffic = overview.servers.reduce((sum, server) => sum + (server.traffic_used || 0), 0)
+  // 百分比的分母永远是「总配额」（每台默认 200GB，N 台就是 200×N），和后端通知、
+  // 实例列表里的流量条同一个口径。阈值只决定什么时候换班，不参与百分比计算——
+  // 阈值 188/200 会让同一份用量在概览显示 100%、在通知里显示 94%，对不上。
+  const totalQuota = overview.servers.reduce((sum, server) => sum + (server.quota_gb || 200), 0)
+  const trafficPercent = totalQuota > 0 ? (totalTraffic / totalQuota) * 100 : 0
   const alarms = overview.servers.filter(
-    (server) => (server.traffic_used || 0) >= server.threshold_gb,
+    // 和后端 shift._over_threshold 同一口径：阈值没配（0）的机器不算超限。
+    // 少了 threshold_gb > 0，0 >= 0 永远成立，概览会报「N 台超阈值」而引擎根本不动作。
+    (server) => server.threshold_gb > 0 && (server.traffic_used || 0) >= server.threshold_gb,
   ).length
+  const recentEvents = overview.events.slice(0, eventCount)
+  const hiddenEvents = overview.events.length - recentEvents.length
 
   return (
     <>
@@ -74,14 +80,7 @@ export default function DashboardView({
         <div>
           <h1>概览</h1>
           <p>
-            当前 {overview.timezone} ·{' '}
-            {new Date(overview.now).toLocaleString('zh-CN', {
-              year: 'numeric',
-              month: '2-digit',
-              day: '2-digit',
-              hour: '2-digit',
-              minute: '2-digit',
-            })}
+            当前 {overview.timezone} · {overview.now_label}
           </p>
         </div>
         <div className="page-actions">
@@ -113,12 +112,12 @@ export default function DashboardView({
         <button
           type="button"
           className="stat stat-link"
-          title="查看服务器列表"
+          title="查看实例列表"
           onClick={() => onNavigate('servers')}
         >
           <div className="stat-main">
             <span className="label">
-              <ServerIcon size={11} /> 服务器
+              <ServerIcon size={11} /> 实例
             </span>
             <span className="value">{overview.servers.length}</span>
             <span className="sub">{running} 台运行中</span>
@@ -191,80 +190,138 @@ export default function DashboardView({
             <span className="sub">{alarms > 0 ? `${alarms} 台超阈值` : '全部低于阈值'}</span>
           </div>
           <Ring
-            percent={alarms > 0 ? Math.min(100, (alarms / Math.max(1, overview.servers.length)) * 100) : 0}
+            percent={trafficPercent}
             tone={alarms > 0 ? 'red' : 'accent'}
             size={46}
+            title={`已用 ${totalTraffic.toFixed(1)} GB / 总配额 ${totalQuota} GB`}
           >
-            {alarms > 0 ? `${alarms}` : '稳'}
+            {`${Math.round(trafficPercent)}%`}
           </Ring>
         </div>
       </div>
 
-      {overview.groups.length > 0 && (
-        <div className="section">
-          <div className="section-head">
-            <h2>当前当班</h2>
-            <span>联合换班组实时状态</span>
-          </div>
-          <div className="group-grid">
-            {overview.groups.map((group) => {
-              const duty = group.members.find((member) => member.is_duty)
-              const standby = group.members.filter(
-                (member) => member.enabled && !member.is_duty,
-              )
-              return (
-                <div className="card group-card" key={group.id}>
-                  <div className="group-head">
-                    <Repeat size={15} style={{ color: 'var(--green)' }} />
-                    <h3>{group.name}</h3>
-                    <Badge tone={phaseTone(group.phase)} pulse={group.phase === 'switching'}>
-                      {group.phase_label}
-                    </Badge>
-                  </div>
-                  {duty?.server ? (
-                    <div className="slot is-duty">
-                      <div className="slot-top">
-                        <span>{duty.hours} 小时班</span>
-                        <span className="duty-tag">当班</span>
-                      </div>
-                      <div className="slot-name">{duty.server.label}</div>
-                      <div className="slot-line">
-                        <Badge tone={statusTone(duty.server.instance_status)}>
-                          {statusLabel(duty.server.instance_status, duty.server.stopped_mode)}
-                        </Badge>
-                        <code>{duty.server.public_ip || '—'}</code>
-                      </div>
-                      <Meter
-                        used={duty.server.traffic_used}
-                        quota={duty.server.quota_gb}
-                        threshold={duty.server.threshold_gb}
-                      />
-                    </div>
-                  ) : (
-                    <div className="slot">
-                      <div className="slot-name">未计算出当班</div>
-                    </div>
-                  )}
-                  <div className="group-foot">
-                    <span>
-                      待机 {standby.length} 台 ·{' '}
-                      {standby.map((member) => member.server?.label ?? '?').join('、') || '无'}
-                    </span>
-                    {group.next_switch_at > 0 && (
-                      <span style={{ marginLeft: 'auto' }}>
-                        下次 {new Date(group.next_switch_at * 1000).toLocaleTimeString('zh-CN', {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              )
-            })}
+      {/* 实例状态：一台实例一行（列表形态），横向把 状态/名称/地域/IP/归属/费用/流量
+          全部摊在一条基线上，比卡片网格更好横向对比。配色沿用概览的绿调：
+          运行中的行左侧铺一层浅绿渐层 + 绿描边徽章，停机行保持中性。 */}
+      <div className="section">
+        <div className="section-head">
+          <h2>实例状态</h2>
+          <span>全部实例的在线状态、流量与归属</span>
+          <div className="section-actions">
+            <Badge tone={alarms > 0 ? 'amber' : 'gray'}>
+              {overview.servers.length} 台 · {running} 台运行中
+            </Badge>
           </div>
         </div>
-      )}
+        {overview.servers.length === 0 ? (
+          <div className="card">
+            <Empty icon={<ServerIcon size={20} />} title="还没有实例">
+              去「实例管理」添加阿里云账号与 ECS 实例后，这里会展示每台的状态。
+            </Empty>
+          </div>
+        ) : (
+          <div className="card inst-list">
+            <table className="inst-table">
+              <colgroup>
+                <col style={{ width: '12%' }} />
+                <col style={{ width: '21%' }} />
+                <col style={{ width: '13%' }} />
+                <col style={{ width: '15%' }} />
+                <col style={{ width: '13%' }} />
+                <col style={{ width: '12%' }} />
+                <col style={{ width: '14%' }} />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>实例</th>
+                  <th>地域</th>
+                  <th>IP</th>
+                  <th>归属</th>
+                  <th>费用</th>
+                  <th>流量</th>
+                </tr>
+              </thead>
+              <tbody>
+                {overview.servers.map((server) => {
+                  const running = server.instance_status === 'Running'
+                  const owner = server.managed ?? null
+                  // 换班组里此刻当班的那台，保留一个「当班」标记 —— 这是老卡片里唯一有信息量的部分
+                  const dutyOf = overview.groups.find(
+                    (group) => group.duty_server_id === server.id,
+                  )
+                  return (
+                    <tr className={running ? 'is-running' : undefined} key={server.id}>
+                      <td data-label="状态">
+                        <Badge tone={statusTone(server.instance_status)} pulse={running}>
+                          {statusLabel(server.instance_status)}
+                        </Badge>
+                      </td>
+                      {/* 别名下面是实例 ID 胶囊：改名之后还能一眼对上是哪台机器，
+                          ID 比别名长，交给省略号收尾，完整值放 title */}
+                      <td data-label="实例">
+                        <div className="inst-main">
+                          <div className="inst-name-line">
+                            <span className="inst-name" title={server.label}>
+                              {server.label}
+                            </span>
+                            {dutyOf && <span className="duty-tag">当班</span>}
+                          </div>
+                          <span className="inst-id" title={`实例 ID：${server.instance_id}`}>
+                            {server.instance_id}
+                          </span>
+                        </div>
+                      </td>
+                      {/* 这一格只留地域：站点（中国站 / 国际站）在「实例管理」里看得到，
+                          概览要的是「这台在哪个机房」——少一个胶囊，这一列干净很多 */}
+                      <td data-label="地域">
+                        <span className="inst-region" title={server.region_id}>
+                          <MapPin size={11} />
+                          <span className="inst-region-text">{regionLabel(server.region_id)}</span>
+                        </span>
+                      </td>
+                      <td data-label="IP">
+                        <span className="addr-chip">{server.public_ip || '无公网 IP'}</span>
+                      </td>
+                      <td data-label="归属">
+                        <span
+                          className={`inst-owner${owner ? '' : ' is-idle'}`}
+                          title={ownerLabel(owner)}
+                        >
+                          {owner ? ownerBase(owner) : ownerLabel(null)}
+                          {owner && !owner.active && <i> · 已暂停</i>}
+                        </span>
+                      </td>
+                      <td data-label="费用">
+                        <div className="inst-cost">
+                          <span title="本月消费">
+                            <em>本月</em>
+                            {money(server.billing.monthly_cost, server.billing.currency)}
+                          </span>
+                          <span title="账户余额">
+                            <em>余额</em>
+                            {money(server.billing.balance, server.billing.currency)}
+                          </span>
+                        </div>
+                      </td>
+                      <td data-label="流量">
+                        <div className="inst-flow">
+                          <Meter
+                            used={server.traffic_used}
+                            quota={server.quota_gb}
+                            threshold={server.threshold_gb}
+                            compact
+                          />
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
 
       <div className="section">
         <div className="section-head">
@@ -278,7 +335,7 @@ export default function DashboardView({
           </div>
         </div>
         <div className="card card-pad">
-          {overview.events.length === 0 ? (
+          {recentEvents.length === 0 ? (
             <div className="empty">
               <div className="empty-icon">
                 <Info size={20} />
@@ -287,11 +344,23 @@ export default function DashboardView({
               <p>第一轮同步完成后，这里会出现换班与状态变化的记录。</p>
             </div>
           ) : (
-            <div className="events">
-              {overview.events.map((event) => (
-                <EventRow key={event.id} event={event} />
-              ))}
-            </div>
+            <>
+              <div className="events">
+                {recentEvents.map((event) => (
+                  <EventRow key={event.id} event={event} />
+                ))}
+              </div>
+              {hiddenEvents > 0 && (
+                <button
+                  type="button"
+                  className="btn ghost events-more"
+                  onClick={() => setEventCount((current) => current + RECENT_EVENT_PAGE)}
+                >
+                  <ChevronDown size={14} />
+                  显示更多事件（还有 {hiddenEvents} 条）
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -302,12 +371,18 @@ export default function DashboardView({
 // 通知永远是流程的最后一步：事件都是「确认状态到位 → 同步 DDNS → 推送通知」。
 // 旧版本的事件把「已推送…通知」记在了确认之前，这里按显示顺序沉到最后，
 // 让历史事件和新事件读起来一致（各自保持原有的先后关系）。
+// 文案有三代：「已推送 xxx 通知」（更早）、「报告已发送 / 报告发送失败：xxx」（1.3.0 及以前）
+// 和现在的「通知已发送 / 通知发送失败：xxx」。三个都认，历史事件才不会错位。
+function isNotifyStep(text: string) {
+  return text.includes('通知') || text.includes('报告')
+}
+
 function orderSteps(steps: { ts: number; text: string }[]) {
   if (steps.length < 2) return steps
   const notify: typeof steps = []
   const rest: typeof steps = []
   for (const step of steps) {
-    if (step.text.includes('通知')) notify.push(step)
+    if (isNotifyStep(step.text)) notify.push(step)
     else rest.push(step)
   }
   return notify.length ? [...rest, ...notify] : steps
@@ -366,7 +441,7 @@ function EventRow({ event }: { event: EventItem }) {
             <ol className="event-progress">
               {steps.map((step, index) => (
                 <li key={index}>
-                  <span className="event-progress-time">{clock(step.ts)}</span>
+                  <span className="event-progress-time">{clockText(step.ts)}</span>
                   <span className="event-progress-dot" />
                   <span className="event-progress-text">{step.text}</span>
                 </li>
@@ -376,7 +451,7 @@ function EventRow({ event }: { event: EventItem }) {
 
           {!running && finishedAt > 0 && (
             <div className="event-finished">
-              {failed ? '失败于' : '完成于'} {clock(finishedAt)} · 全程{' '}
+              {failed ? '失败于' : '完成于'} {clockText(finishedAt)} · 全程{' '}
               {Math.max(0, finishedAt - event.ts) >= 60
                 ? `${Math.round((finishedAt - event.ts) / 60)} 分钟`
                 : `${Math.max(0, finishedAt - event.ts)} 秒`}
