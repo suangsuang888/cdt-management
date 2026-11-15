@@ -216,6 +216,45 @@ class Cdp {
     await sleep(1200)
     await cdp.shot('02-dashboard.png')
 
+    // 2.0 「最近事件」默认只列 8 条，底下的「显示更多事件」负责展开剩下的（后端最多给 20 条）
+    const recent = await cdp.evaluate(`(() => {
+      const head = [...document.querySelectorAll('.section-head')].find((node) =>
+        (node.textContent || '').includes('最近事件'))
+      const more = document.querySelector('.events-more')
+      return {
+        rows: document.querySelectorAll('.events .event').length,
+        badge: head ? (head.querySelector('.badge') || {}).textContent || '' : '',
+        more: more ? more.textContent.trim() : '',
+      }
+    })()`)
+    const eventRows = recent.rows
+    const eventTotal = Number(recent.badge.trim() || 0)
+    if (eventRows > 8) throw new Error(`最近事件默认显示了 ${eventRows} 条，应不超过 8 条`)
+    if (eventTotal < eventRows) throw new Error(`事件角标 ${eventTotal} 小于列表 ${eventRows} 条`)
+    if (eventTotal > 20) throw new Error(`概览一次给了 ${eventTotal} 条事件，后端上限应为 20`)
+    if (eventTotal > eventRows) {
+      if (!recent.more.includes('显示更多事件')) {
+        throw new Error(`事件还有 ${eventTotal - eventRows} 条没露出来，却没找到「显示更多事件」按钮`)
+      }
+      await cdp.clickSelector('.events-more')
+      await sleep(300)
+      const expanded = await cdp.evaluate(`(() => ({
+        rows: document.querySelectorAll('.events .event').length,
+        more: (document.querySelector('.events-more') || {}).textContent || '',
+      }))()`)
+      if (expanded.rows <= eventRows) throw new Error('点了「显示更多事件」列表没变长')
+      if (expanded.rows > eventTotal) throw new Error('展开后条数超过了总数')
+      if (expanded.rows < eventTotal && !expanded.more.includes('显示更多事件')) {
+        throw new Error('还没展开完，「显示更多事件」按钮就不见了')
+      }
+      console.log(
+        `  ✓ 最近事件默认 8 条，展开后 ${eventRows} → ${expanded.rows}（共 ${eventTotal} 条）`,
+      )
+    } else {
+      if (recent.more) throw new Error('事件已经全部露出来了，不该还有「显示更多事件」按钮')
+      console.log(`  ✓ 最近事件 ${eventRows} 条全部列出，没有多余按钮`)
+    }
+
     // 2.1 概览页前三个指标卡要能点进对应页面（顺序：服务器 / 单机保活 / 联合换班）
     const navByStat = await cdp.evaluate(`(async () => {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -252,6 +291,9 @@ class Cdp {
 
     await cdp.clickByText('.sidebar .nav-item', '服务器')
     await cdp.shot('05-servers.png')
+    const ownerCards = await cdp.evaluate(
+      `[...document.querySelectorAll('.server-grid .owner-tag')].map((node) => node.textContent.trim())`,
+    )
 
     // 3.1 列表视图：域名列的逻辑跟卡片一致（组域名只在当班那台），且不许被撑出横向滚动条
     await cdp.clickByText('.view-toggle button', '列表')
@@ -278,6 +320,17 @@ class Cdp {
       throw new Error('列表视图没显示域名框：' + JSON.stringify(tableCheck))
     }
     console.log(`  ✓ 列表视图无横向滚动（${tableCheck.rows} 行 / ${tableCheck.chips} 个域名框）`)
+
+    // 3.2 归属列的文字必须跟卡片一模一样（以前两处各写一套，措辞会飘）
+    const ownerRows = await cdp.evaluate(
+      `[...document.querySelectorAll('.server-table tbody .owner-tag')].map((node) => node.textContent.trim())`,
+    )
+    if (ownerCards.length !== ownerRows.length || ownerCards.some((text, index) => text !== ownerRows[index])) {
+      throw new Error(
+        '列表归属列和卡片不一致：卡片 ' + JSON.stringify(ownerCards) + ' / 列表 ' + JSON.stringify(ownerRows),
+      )
+    }
+    console.log(`  ✓ 列表归属列与卡片一致（${ownerRows.length} 台）`)
     await cdp.shot('05b-servers-list.png')
 
     // 3.5 DNS 页：一条域名只绑一个目标，没绑的不动
@@ -328,6 +381,35 @@ class Cdp {
     await cdp.waitSelector('.modal')
     await cdp.shot('10-group-dialog.png')
     await cdp.clickSelector('.modal .close')
+
+    // 5.1 新建组：成员框留空由用户自己选；选择器里已编组的机器要是灰的
+    await cdp.clickByText('.page-actions button', '新建换班组')
+    await cdp.waitSelector('.member-pick')
+    const emptyPicks = await cdp.evaluate(
+      `[...document.querySelectorAll('.member-pick')].map((node) => node.textContent.trim())`,
+    )
+    if (!emptyPicks.length || emptyPicks.some((text) => text !== '选择服务器')) {
+      throw new Error('新建组默认没留空：' + JSON.stringify(emptyPicks))
+    }
+    await cdp.clickSelector('.member-pick')
+    await cdp.waitSelector('.server-pick-list')
+    await sleep(400)
+    const pickRows = await cdp.evaluate(`[...document.querySelectorAll('.server-pick-row')].map((node) => ({
+      owner: node.querySelector('.owner-tag').textContent.trim(),
+      disabled: node.disabled,
+    }))`)
+    if (!pickRows.some((row) => row.owner.includes('换班组') && row.disabled)) {
+      throw new Error('选择器里已加入换班组的机器不是灰的：' + JSON.stringify(pickRows))
+    }
+    if (!pickRows.some((row) => row.owner.includes('闲散') && !row.disabled)) {
+      throw new Error('选择器里没有可选的闲散机器')
+    }
+    await cdp.shot('10b-group-picker.png')
+    await cdp.evaluate(`[...document.querySelectorAll('.modal')].pop().querySelector('.close').click()`)
+    await sleep(400)
+    await cdp.clickSelector('.modal .close')
+    await sleep(300)
+    console.log('  ✓ 新建组默认留空，选择器按归属灰选')
 
     // 6. 添加服务器：站点类型 + 按站点过滤的地域
     await cdp.clickByText('.sidebar .nav-item', '服务器')
