@@ -33,7 +33,12 @@ COPY docker-entrypoint.py ./docker-entrypoint.py
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin cdt \
     && mkdir -p /data \
-    && chown -R cdt:cdt /data /app
+    && chown -R cdt:cdt /data /app \
+    && chmod 0777 /data
+
+# Orkestr 这类去掉全部 capabilities 的平台上，root 没有 CAP_DAC_OVERRIDE，
+# 降权失败后以 uid 0 运行时写不进 10001 属主的 /data；放开目录权限兜底。
+# 正常 Docker 部署不受影响：入口脚本仍会 chown 并降权到 10001 再拉起应用。
 
 # 故意不写 USER：入口脚本要先以 root 修好 bind mount 目录的属主（宿主机目录通常属于 root），
 # 修完立刻 setuid 降权到 10001 再拉起应用。业务进程始终不以 root 运行。
