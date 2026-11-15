@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import socket
 import threading
 import time
@@ -46,7 +47,112 @@ if urllib3_conn is not None:
 
 
 class AliyunError(RuntimeError):
-    pass
+    """带分类的阿里云调用错误。kind：stock / auth / throttle / transient / other。"""
+
+    def __init__(self, message: str, *, kind: str = "") -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def classify_error(exc: Exception | str) -> str:
+    """把异常归成大类，供上层决定重试策略：auth 停手、throttle 退避、stock 换机、transient 计重试。"""
+    text = str(exc)
+    low = text.lower()
+    if any(hint in low for hint in _AUTH_ERROR_HINTS):
+        return "auth"
+    if any(hint in low for hint in _THROTTLE_HINTS):
+        return "throttle"
+    if any(hint in low for hint in _NO_STOCK_HINTS):
+        return "stock"
+    if any(hint in low for hint in _NET_ERROR_HINTS) or any(hint in low for hint in _TIMEOUT_HINTS):
+        return "transient"
+    return "other"
+
+
+# SDK 原始异常动辄几百字符：整条签名 URL + 对象地址，还带 AccessKeyId / Signature。
+# 直接写进事件既没法看，也等于把凭据摊在通知里。这里归成一句人话再往上抛。
+_NET_ERROR_HINTS = (
+    "network is unreachable",
+    "max retries exceeded",
+    "newconnectionerror",
+    "failed to establish a new connection",
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "temporary failure in name resolution",
+    "name or service not known",
+)
+_TIMEOUT_HINTS = ("timed out", "timeout", "readtimeout")
+_AUTH_ERROR_HINTS = (
+    "signaturedoesnotmatch",
+    "invalidaccesskeyid",
+    "invalidaccesskeysecret",
+    "authfailure",
+    "authsitefail",
+    "forbidden",
+    "unauthorized",
+    "accessdenied",
+)
+_THROTTLE_HINTS = ("throttling", "requestlimitexceeded", "serviceunavailable")
+# 开机被阿里云拒掉时「库存不足」的几个错误码：抢占式规格售罄时会命中。
+# 和限流 / 欠费 / 鉴权是两回事：库存等一会儿可能就有了，欠费 / 权限得人去处理。
+_NO_STOCK_HINTS = ("insufficientinventory", "nostock")
+
+_SECRET_PARAM_RE = re.compile(
+    r"(?i)\b(Signature|AccessKeyId|AccessKeySecret|SecurityToken|SignatureNonce)=([^&\s'\"]+)"
+)
+
+
+def _error_host(text: str) -> str:
+    match = re.search(r"host=(?:'|\")?([^'\",\s\)]+)", text)
+    return match.group(1) if match else ""
+
+
+def _redact(text: str) -> str:
+    text = _SECRET_PARAM_RE.sub(r"\1=***", text)
+    text = re.sub(r"<[^>]*object at 0x[0-9a-fA-F]+>", "<sdk-error>", text)
+    # 对象地址每次调用都不一样。留着它，同一句错误在事件进度里「每行都不同」，
+    # 相邻去重就失效了 —— 5 秒一轮的确认器能把一条保活事件刷满。
+    text = re.sub(r"\b0x[0-9a-fA-F]{4,}\b", "0x***", text)
+    return text.strip()
+
+
+def brief_error(exc: Exception | str) -> str:
+    """把 SDK 原始异常压成一句能直接放进事件/通知的话（脱敏 + 分类）。"""
+    text = str(exc)
+    low = text.lower()
+    host = _error_host(text)
+
+    if any(hint in low for hint in _NET_ERROR_HINTS):
+        return f"网络不可达（{host}）" if host else "网络不可达"
+    if any(hint in low for hint in _TIMEOUT_HINTS):
+        return f"连接超时（{host}）" if host else "连接超时"
+    if any(hint in low for hint in _AUTH_ERROR_HINTS):
+        return "鉴权失败（AccessKey 无效或无权限）"
+    if any(hint in low for hint in _THROTTLE_HINTS):
+        return "接口限流，稍后重试"
+
+    # 拿得到阿里云错误码就「错误码：消息」，否则脱敏后截断，绝不整段照搬
+    code = ""
+    message = ""
+    get_code = getattr(exc, "get_error_code", None)
+    get_msg = getattr(exc, "get_error_msg", None)
+    if callable(get_code):
+        try:
+            code = str(get_code() or "").strip()
+        except Exception:  # noqa: BLE001
+            code = ""
+    if callable(get_msg):
+        try:
+            message = str(get_msg() or "").strip()
+        except Exception:  # noqa: BLE001
+            message = ""
+    if code and code.lower() not in ("sdk.httperror", "sdk.servererror", "sdk.clienterror"):
+        # 这一支也要过 _redact：部分接口的 Message 会回显请求参数（含
+        # AccessKeyId / Signature），整段照搬等于把凭据写进事件和通知。
+        text = f"{code}：{message}" if message else code
+        return _redact(text)[:140]
+    return _redact(text)[:140]
 
 
 # --------------------------------------------------------------------------
@@ -153,7 +259,7 @@ def _bss_with_site_fallback(
 
 
 def get_account_balance(account: dict, force: bool = False) -> dict[str, Any]:
-    """账户可用额度。返回 {"amount": float, "currency": "CNY", "site": str}。
+    """账户余额（可用额度 AvailableAmount）。返回 {"amount": float, "currency": "CNY", "site": str}。
 
     同一 AK + 站点 6 小时内复用缓存：余额变动慢，没必要每次对账都问一遍。
     """
@@ -175,7 +281,7 @@ def get_account_balance(account: dict, force: bool = False) -> dict[str, Any]:
     try:
         data, site = _bss_with_site_fallback(account, "QueryAccountBalance")
     except Exception as exc:  # noqa: BLE001
-        raise AliyunError(f"账户余额查询失败: {exc}") from exc
+        raise AliyunError(f"账户余额查询失败：{brief_error(exc)}") from exc
 
     payload = data.get("Data") or {}
     try:
@@ -202,30 +308,40 @@ def get_instance_bill(account: dict, cycle: str) -> dict[str, Any]:
             "site": str(account.get("site") or "china"),
         }
 
-    params = {
-        "BillingCycle": cycle,
-        "InstanceID": str(account.get("instance_id") or ""),
-        "Granularity": "MONTHLY",
-        "MaxResults": "300",
-    }
-    try:
-        data, site = _bss_with_site_fallback(account, "DescribeInstanceBill", params)
-    except Exception as exc:  # noqa: BLE001
-        raise AliyunError(f"实例账单查询失败: {exc}") from exc
-
-    items = (data.get("Data") or {}).get("Items") or []
-    # 有的返回把数组包一层 {"Item": [...]}
-    if isinstance(items, dict):
-        items = items.get("Item") or []
-
     total = 0.0
-    for item in items:
-        if not isinstance(item, dict):
-            continue
+    site = str(account.get("site") or "china")
+    next_token = ""
+    # DescribeInstanceBill 每页最多 300 行明细，费用按行累加；超过一页必须循
+    # 环 NextToken 直到取空，否则多产品/多账单行的实例月费会被静默少算。
+    for _ in range(100):  # 防御上限：正常远到不了 100 页，避免异常数据死循环
+        params = {
+            "BillingCycle": cycle,
+            "InstanceID": str(account.get("instance_id") or ""),
+            "Granularity": "MONTHLY",
+            "MaxResults": "300",
+        }
+        if next_token:
+            params["NextToken"] = next_token
         try:
-            total += float(item.get("PretaxAmount") or 0)
-        except (TypeError, ValueError):
-            continue
+            data, site = _bss_with_site_fallback(account, "DescribeInstanceBill", params)
+        except Exception as exc:  # noqa: BLE001
+            raise AliyunError(f"实例账单查询失败：{brief_error(exc)}") from exc
+
+        items = (data.get("Data") or {}).get("Items") or []
+        # 有的返回把数组包一层 {"Item": [...]}
+        if isinstance(items, dict):
+            items = items.get("Item") or []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                total += float(item.get("PretaxAmount") or 0)
+            except (TypeError, ValueError):
+                continue
+
+        next_token = str((data.get("Data") or {}).get("NextToken") or "")
+        if not next_token:
+            break
     return {"total": round(total, 2), "site": site}
 
 
@@ -331,8 +447,13 @@ def _mock_advance(state: dict[str, Any]) -> None:
             state["stopped_mode"] = ""
 
 
-def get_traffic_gb(account: dict) -> float:
-    """CDT 当月出方向流量（GB）。与用户脚本一致：累加所有 TrafficDetails。"""
+def get_traffic_gb(account: dict) -> float | None:
+    """CDT 当月出方向流量（GB）。与用户脚本一致：累加所有 TrafficDetails。
+
+    返回 None 表示「接口调用成功，但一个明细都没给」。不在这里折算成 0.0：
+    月初流量包重置后确实是 0，接口抖动时也是空列表，两者在这一层分不开，
+    交给调用方结合上次读数判断（见 shift._resolve_empty_traffic）。
+    """
     if settings.DRY_RUN:
         return float(_mock(account)["traffic"])
     client = _client(account, CDT_REGION)
@@ -345,10 +466,11 @@ def get_traffic_gb(account: dict) -> float:
         raw = client.do_action_with_exception(request)
         data = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        raise AliyunError(f"CDT 流量查询失败: {exc}") from exc
-    total_bytes = sum(
-        float(item.get("Traffic", 0) or 0) for item in data.get("TrafficDetails", []) or []
-    )
+        raise AliyunError(f"CDT 流量查询失败：{brief_error(exc)}") from exc
+    details = data.get("TrafficDetails") or []
+    if not details:
+        return None
+    total_bytes = sum(float(item.get("Traffic", 0) or 0) for item in details)
     return total_bytes / (1024 ** 3)
 
 
@@ -369,9 +491,18 @@ def get_instance(account: dict) -> InstanceInfo:
     try:
         raw = client.do_action_with_exception(request)
         data = json.loads(raw.decode("utf-8"))
-        instance = data["Instances"]["Instance"][0]
+        instances = (data.get("Instances") or {}).get("Instance") or []
+        if not instances:
+            # 实例被释放 / 实例 ID 填错 / 地域填错，返回的就是空列表。不拦住的话
+            # 用户看到的是「实例状态查询失败：list index out of range」。
+            raise AliyunError(
+                "实例状态查询失败：实例不存在或已释放，请检查实例 ID 与地域"
+            )
+        instance = instances[0]
+    except AliyunError:
+        raise
     except Exception as exc:
-        raise AliyunError(f"实例状态查询失败: {exc}") from exc
+        raise AliyunError(f"实例状态查询失败：{brief_error(exc)}") from exc
 
     status = str(instance.get("Status") or "")
     mode = str(instance.get("StoppedMode") or "")
@@ -383,6 +514,16 @@ def get_instance(account: dict) -> InstanceInfo:
         addresses = (instance.get("PublicIpAddress") or {}).get("IpAddress") or []
         public_ip = str(addresses[0]) if addresses else ""
     return InstanceInfo(status, mode, public_ip, region)
+
+
+def _error_code(exc: Exception) -> str:
+    get_code = getattr(exc, "get_error_code", None)
+    if not callable(get_code):
+        return ""
+    try:
+        return str(get_code() or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def start_instance(account: dict) -> None:
@@ -408,17 +549,34 @@ def start_instance(account: dict) -> None:
     try:
         client.do_action_with_exception(request)
     except Exception as exc:
-        message = str(exc)
-        if "InsufficientInventory" in message:
-            raise AliyunError("库存不足（InsufficientInventory），该地域暂无可用抢占式库存") from exc
-        raise AliyunError(f"启动实例失败: {message}") from exc
+        # 网络/超时这类瞬态失败，开机指令可能已到达阿里云：先回查一次真实状态，
+        # 已进入目标态就当作成功，避免上层下一轮重复下发开机、重复烧钱。
+        if classify_error(exc) == "transient":
+            try:
+                if get_instance(account).status in ("Running", "Starting", "Pending"):
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+        raw = f"{_error_code(exc)} {exc}".lower()
+        if any(hint in raw for hint in _NO_STOCK_HINTS):
+            # 原来只有 InsufficientInventory 一种，NoStock / OperationDenied.NoStock
+            # 都落到「启动实例失败：…」，事件详情里看不出是库存没了还是配置错了。
+            code = _error_code(exc) or "InsufficientInventory"
+            raise AliyunError(
+                f"库存不足（{code}），{account.get('region_id') or '该地域'} 暂无可用实例库存",
+                kind="stock",
+            ) from exc
+        raise AliyunError(f"启动实例失败：{brief_error(exc)}", kind=classify_error(exc)) from exc
 
 
-def stop_instance(account: dict, mode: str = "StopCharging", fallback: bool = False) -> None:
+def stop_instance(account: dict, mode: str = "StopCharging", fallback: bool = False) -> str:
     """mode=StopCharging 为「节省停机」，不计实例规格费用。
 
     fallback=True 时，如果实例不支持节省停机（部分规格 / 包年包月按固定价），
     自动退化成普通停机，避免手动关机直接报错没法用。
+
+    返回**实际生效**的停机模式（走了 fallback 就是 "Stop"），调用方据此写文案 ——
+    退化成普通停机还报「已节省停机」是在骗人，那台机器照常收规格费。
     """
     if settings.DRY_RUN:
         log.info("[dry-run] stop %s mode=%s", account.get("instance_id"), mode)
@@ -435,20 +593,31 @@ def stop_instance(account: dict, mode: str = "StopCharging", fallback: bool = Fa
                 state["stopped_mode"] = mode
                 state["target_status"] = "Stopped"
                 state["pending_until"] = time.time() + delay
-        return
+        return mode
     client = _client(account)
     request = StopInstancesRequest.StopInstancesRequest()
     request.set_InstanceIds([account["instance_id"]])
     request.set_StoppedMode(mode)
     try:
         client.do_action_with_exception(request)
+        return mode
     except Exception as exc:
+        # 瞬态失败时停机指令可能已到达：回查一次，已进入停机态就当作成功，
+        # 避免对一台已在停机的实例二次下发、还把停机模式无谓降级。
+        if classify_error(exc) == "transient":
+            try:
+                if get_instance(account).status in ("Stopped", "Stopping"):
+                    return mode
+            except Exception:  # noqa: BLE001
+                pass
         if fallback and mode != "Stop":
-            log.warning("节省停机失败，退化为普通停机: %s", exc)
+            log.warning("节省停机失败，退化为普通停机: %s", brief_error(exc))
             request.set_StoppedMode("Stop")
             try:
                 client.do_action_with_exception(request)
-                return
+                return "Stop"
             except Exception as retry_exc:  # noqa: BLE001
-                raise AliyunError(f"停止实例失败: {retry_exc}") from retry_exc
-        raise AliyunError(f"停止实例失败: {exc}") from exc
+                raise AliyunError(
+                    f"停止实例失败：{brief_error(retry_exc)}", kind=classify_error(retry_exc)
+                ) from retry_exc
+        raise AliyunError(f"停止实例失败：{brief_error(exc)}", kind=classify_error(exc)) from exc
