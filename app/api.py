@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 import ipaddress
 import json
 import logging
+import math
 import threading
 import time
 from typing import Any
@@ -13,7 +15,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from . import aliyun, billing, ddns, dns, notify, repo, security, settings
+from . import aliyun, billing, ddns, dns, messages, notify, repo, security, settings
 from .shift import (
     PHASE_BREAKER,
     PHASE_ERROR,
@@ -21,12 +23,15 @@ from .shift import (
     PHASE_MANUAL,
     PHASE_SETTLED,
     PHASE_SWITCHING,
+    TRANSIENT_STATUS,
     _hhmm_to_minutes,
     _timezone,
     active_members,
+    actual_duty,
     current_member_index,
-    duty_at,
     engine,
+    keepalive_window,
+    member_span_label,
     next_switch_at,
 )
 
@@ -42,18 +47,91 @@ PHASE_LABELS = {
     "pending": "待执行",
 }
 
+# 换班组徽章：说「此刻真实状态」，而不是上一轮写进库的阶段。
+# 手动把当班关掉、换班还没落地、被抢占正在拉起，界面上都要如实显示。
+GROUP_STATES = {
+    "scheduled": "正常排班中",
+    "switching": "换班中",
+    "failover": "故障转移中",
+    "manual": "手动换班中",
+    "recovering": "恢复中",
+    "breaker": "已熔断停机",
+    "error": "换班异常",
+    "disabled": "已停用",
+    "idle": "待排班",
+    "unknown": "状态未知",
+}
+
+
+def group_state(
+    group: dict[str, Any],
+    run: dict[str, Any],
+    picked: tuple[dict[str, Any], int] | None,
+    members: list[dict[str, Any]],
+    servers: dict[int, dict[str, Any]],
+) -> str:
+    """按「实际状态 vs 排班表」判当前状态，供界面徽章使用。
+
+    优先级：停用 / 待排班 / 异常 / 熔断 → 状态未知 → 换班或恢复中 →
+    故障转移或手动换班（整段班次都算）→ 正常排班中。
+    下次正常换班会开新班次（新的 run），手动 / 故障转移的标记随之清零。
+    """
+    if not group.get("enabled"):
+        return "disabled"
+    if not picked or len(members) < 2:
+        return "idle"
+
+    phase = str(run.get("phase") or "")
+    if phase == PHASE_ERROR:
+        return "error"
+    if phase == PHASE_BREAKER:
+        return "breaker"
+
+    duty_id = int(picked[0]["server_id"])
+    duty = servers.get(duty_id) or {}
+    duty_status = str(duty.get("instance_status") or "")
+    if not duty_status:
+        return "unknown"
+
+    # 覆盖来源：故障转移 / 手动换班会在整段班次里换掉当班，颜色据此走
+    override = "failover" if run.get("failover") else "manual" if run.get("manual") else ""
+
+    if duty_status in TRANSIENT_STATUS:
+        return override or "switching"
+    if duty_status != "Running":
+        # 该跑却没跑：被抢占或被手动关机，引擎正拉起
+        return "recovering"
+    unknown_member = False
+    for member in members:
+        other_id = int(member["server_id"])
+        if other_id == duty_id:
+            continue
+        other = servers.get(other_id) or {}
+        other_status = str(other.get("instance_status") or "")
+        if other_status == "Running" or other_status in TRANSIENT_STATUS:
+            # 非当班还有在跑或正在停：换班还没到位
+            return override or "switching"
+        if not other_status:
+            unknown_member = True
+    if unknown_member:
+        # 有成员状态还没读到：不知道它停没停，不能报「正常排班中」
+        return "unknown"
+    return override or "scheduled"
+
+
 # 配置变更事件里给人看的字段名，避免把 ddns_cf_token 这种内部键直接甩到界面上
 SETTING_LABELS = {
     "timezone": "时区",
     "traffic_threshold_pct": "流量阈值",
     "reconcile_interval": "同步间隔",
+    "reconcile_offset": "巡检起始秒",
     "daily_report_enabled": "每日汇总",
     "daily_report_time": "汇总时间",
     "notify_on_shift": "换班通知",
     "notify_on_failover": "故障转移通知",
     "notify_on_recovery": "抢占恢复通知",
     "notify_on_breaker": "全局熔断通知（全部成员）",
-    "notify_on_limit_stop": "全局熔断通知（单台）",
+    "notify_on_limit_stop": "超限停机通知（单台）",
     "notify_on_error": "异常通知",
     "notify_on_keepalive": "保活通知",
     "ddns_enabled": "DDNS 开关",
@@ -184,6 +262,10 @@ _login_lock = threading.Lock()
 LOGIN_WINDOW = 300
 LOGIN_MAX_FAILURES = 8
 
+# 概览页的事件窗口：一次最多给这么多条。前端先露 8 条，
+# 剩下的点「显示更多事件」再展开，不用每次翻页都重新请求。
+OVERVIEW_EVENT_LIMIT = 20
+
 
 # --------------------------------------------------------------------------
 # 鉴权
@@ -291,9 +373,14 @@ def _validate_timetable_coverage(members: list[dict[str, Any]]) -> None:
     owner = [-1] * 1440
     for index, (start, end) in enumerate(spans):
         if start == end:
+            raise ValueError(f"「{texts[index][0]}」的起止时刻不能相同")
+        # 排班表就是一天 0–24 点之内切分，不支持跨天：结束 00:00 是「到午夜」，
+        # 其余「结束早于开始」的写法（18:00–06:00）一律拒绝，免得同一份配置
+        # 在面板、通知、引擎三处含义不一致。
+        if end < start and end != 0:
             raise ValueError(
-                f"「{texts[index][0]}」的起止时刻不能相同；"
-                "跨天班次让结束时刻小于开始时刻即可，比如 18:00–06:00"
+                f"「{texts[index][0]}」{texts[index][1]}–{texts[index][2]} 的结束时刻早于"
+                "开始时刻；排班按一天 0–24 点分，到午夜请把结束填成 24:00"
             )
         ranges = [(start, 1440), (0, end)] if end < start else [(start, end)]
         for lo, hi in ranges:
@@ -345,6 +432,44 @@ def _validate_group_timetable(payload: dict[str, Any]) -> None:
         _validate_timetable_coverage(members)
 
 
+def _keepalive_window(payload: dict[str, Any]) -> tuple[str, str, int, int]:
+    """解析并校验单机保活的运行窗口，返回 (start_time, end_time, start_day, end_day)。
+
+    两个维度都只允许「全空（不限）」或「成对」：
+
+    - 时段在 24 小时循环上理解：结束晚于开始 = 当天内；结束早于开始 = 跨天到次日
+      （「20:00–06:00」即今天 20 点跑到次日 6 点）；结束填 00:00 且开始非零按老
+      习惯表示「到当天 24:00」；起止相同 = 正好 24 小时整，等于不限（前端会提示）。
+    - 日期必须在同一个月内（1 ≤ start ≤ end ≤ 31，不跨月）：每个月天数不同，
+      跨月边界没法用两个固定数字表达。
+
+    只填一半（比如只填开始时刻）当错误处理，不做静默兜底 —— 静默兜底的结果是
+    界面显示着时段、引擎却当没配，这种「表里不一」最难排查。
+    """
+    start_raw = str(payload.get("start_time") or "").strip()
+    end_raw = str(payload.get("end_time") or "").strip()
+    if bool(start_raw) != bool(end_raw):
+        raise ValueError("运行时段的起止时刻要成对填写，或都留空（全天）")
+    if start_raw:
+        if not repo.is_hhmm(start_raw) or not repo.is_hhmm(end_raw):
+            raise ValueError("运行时段要用 HH:MM 格式，例如 08:00")
+
+    try:
+        start_day = int(payload.get("start_day") or 0)
+        end_day = int(payload.get("end_day") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("运行日期必须是 1–31 的数字") from None
+    if bool(start_day) != bool(end_day):
+        raise ValueError("运行日期的起止日要成对填写，或都留空（全月）")
+    if start_day:
+        if not (1 <= start_day <= 31 and 1 <= end_day <= 31):
+            raise ValueError("运行日期必须在 1–31 之间")
+        if end_day < start_day:
+            raise ValueError("运行日期的结束日不能早于开始日（不支持跨月）")
+
+    return start_raw, end_raw, start_day, end_day
+
+
 def _managed_map() -> dict[int, dict[str, Any]]:
     """哪台服务器被哪个自动化流程接管。
 
@@ -375,13 +500,27 @@ def _managed_map() -> dict[int, dict[str, Any]]:
     return managed
 
 
+def _finite_gb(value: Any, fallback: float = 0.0) -> float:
+    """老库里可能已经有 inf / nan（1.3.6 之前写入没拦），展示时兜成有限值。
+
+    JSON 不接受 Infinity / NaN，一条脏数据就能让整个服务器页和仪表盘返回 400；
+    兜底后页面还能打开，用户也能进编辑框把数值改回来。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if math.isfinite(number) else fallback
+
+
 def server_summary(
     server: dict[str, Any],
     managed: dict[int, dict[str, Any]] | None = None,
     dns_map: dict[int, list[str]] | None = None,
 ) -> dict[str, Any]:
     used = server.get("traffic_used")
-    quota = float(server.get("quota_gb") or 0) or 1
+    quota_raw = server.get("quota_gb")
+    quota = _finite_gb(quota_raw) or 1
     owner = (managed or {}).get(int(server.get("id") or 0))
     return {
         "id": server.get("id"),
@@ -390,12 +529,13 @@ def server_summary(
         "region_id": server.get("region_id") or "",
         "site": repo.normalize_site(server.get("site")),
         "instance_id": server.get("instance_id") or "",
-        "quota_gb": server.get("quota_gb") or 0,
-        "threshold_gb": server.get("threshold_gb") or 0,
+        "quota_gb": _finite_gb(quota_raw),
+        "threshold_gb": _finite_gb(server.get("threshold_gb")),
         "remark": server.get("remark") or "",
         "traffic_used": used,
         "traffic_percent": round((used or 0) / quota * 100, 2) if used is not None else None,
         "instance_status": server.get("instance_status") or "Unknown",
+        "stop_mode": repo.normalize_stop_mode(server.get("stop_mode")),
         "stopped_mode": server.get("stopped_mode") or "",
         "public_ip": server.get("public_ip") or "",
         "traffic_checked_at": server.get("traffic_checked_at") or 0,
@@ -418,15 +558,13 @@ def _group_payload(
     books: dict[str, dict[int, list[str]]] | None = None,
 ) -> dict[str, Any]:
     members = active_members(group)
-    picked = duty_at(group, now_ts)
+    # 「此刻谁是当班」只有一处判定：故障转移和人工换班都会覆盖时钟算出来的那台。
+    # 这里以前只认 failover，手动换完班界面还高亮着上一台（而且是已停机的那台）。
+    picked = actual_duty(group, now_ts)
     duty_id = int(picked[0]["server_id"]) if picked else 0
     shift_start = picked[1] if picked else 0
     slot_key = str(shift_start)
     run = repo.get_run(int(group["id"]), slot_key) or {} if picked else {}
-    # 本班次内发生过故障转移时，真正在跑的是替补，界面上的「当班」必须跟着它走，
-    # 否则会高亮一台已经停机的机器
-    if run.get("failover") and int(run.get("duty_server_id") or 0):
-        duty_id = int(run["duty_server_id"])
     nxt = next_switch_at(group, now_ts)
     servers = {int(s["id"]): s for s in repo.list_servers()}
 
@@ -439,6 +577,10 @@ def _group_payload(
                 "server_id": member["server_id"],
                 "position": member["position"],
                 "hours": member["hours"],
+                "days": member.get("days") or 0,
+                # 这一班在人眼里的写法：月模式「1–15 日」、时刻表「08:00–20:00」，
+                # 空串表示走老的小时累加模式，界面自己退回「N 小时」
+                "span_label": member_span_label(group, member, now_ts),
                 "slot_name": member.get("slot_name") or "",
                 "start_time": member.get("start_time") or "",
                 "end_time": member.get("end_time") or "",
@@ -450,11 +592,14 @@ def _group_payload(
             }
         )
 
+    state = group_state(group, run, picked, members, servers)
+
     return {
         "id": group["id"],
         "name": group.get("name") or "",
         "enabled": bool(group.get("enabled")),
         "failover_enabled": bool(group.get("failover_enabled")),
+        "cycle": str(group.get("cycle") or "day"),
         # 绑定关系在 DNS 页维护，这里只是读出来显示（可能有多条，顿号连接）
         "ddns_record": "、".join((books or {}).get("groups", {}).get(int(group["id"]), [])),
         "anchor_at": group.get("anchor_at") or 0,
@@ -465,6 +610,8 @@ def _group_payload(
         "next_switch_at": int(nxt) if nxt else 0,
         "phase": run.get("phase") or "pending",
         "phase_label": PHASE_LABELS.get(run.get("phase") or "pending", "待执行"),
+        "state": state,
+        "state_label": GROUP_STATES.get(state, "状态未知"),
         "note": run.get("note") or "",
         "updated_at": run.get("updated_at") or 0,
         "current_index": current_member_index(group, now_ts),
@@ -484,6 +631,13 @@ def register(app: FastAPI) -> None:
     def _http_error(_request: Request, exc: HTTPException):  # noqa: ANN202
         code = "unauthorized" if exc.status_code == 401 else "request_failed"
         return _error(exc.status_code, code, str(exc.detail))
+
+    @app.exception_handler(Exception)
+    def _unhandled(_request: Request, exc: Exception):  # noqa: ANN202
+        # 兜住所有没被上面 handler 接住的异常（阿里云调用、SQLite 锁、出网失败等），
+        # 别把 Python 栈和内部路径直接甩给前端，也别让请求变成一句无信息的 500。
+        log.exception("未处理异常")
+        return _error(500, "internal_error", "服务器内部错误，请查看日志")
 
     # -- 系统 -----------------------------------------------------------
     @app.get("/api/health")
@@ -516,7 +670,7 @@ def register(app: FastAPI) -> None:
                 "initialized": "1",
             }
         )
-        repo.add_event("system", "系统初始化完成", f"管理员：{username}")
+        repo.add_event("system", messages.ev("系统初始化完成"), f"已初始化 / 管理员 {username}")
         response = JSONResponse({"ok": True})
         _attach_session(response, username)
         return response
@@ -577,6 +731,12 @@ def register(app: FastAPI) -> None:
         return {
             "now": now.isoformat(),
             "now_ts": int(now.timestamp()),
+            # 界面上的日期 / 时刻一律以这里为准，前端不再用 new Date() 自己算：
+            # 用户可能在国外用浏览器打开，浏览器时区和排班时区差几个小时甚至一天，
+            # 自己算就会出现「排班表说今天换班、页面说还没到」这种自相矛盾。
+            "now_label": now.strftime("%Y-%m-%d %H:%M"),
+            "today": now.date().isoformat(),
+            "month_days": calendar.monthrange(now.year, now.month)[1],
             "timezone": config.get("timezone"),
             "version": settings.VERSION,
             "brand": settings.BRAND,
@@ -587,6 +747,10 @@ def register(app: FastAPI) -> None:
             "keepalives": [
                 {
                     **item,
+                    # 与 /api/v1/keepalives 同一套判定。卡片要据此把窗口外的机器
+                    # 显示成「休止时段」，少了这个字段，窗口外已停机的卡片还会
+                    # 写着「保活运行中」，看着像机器挂了。
+                    "in_window": keepalive_window(item, now)[0],
                     "dns_record": "、".join(books.get("servers", {}).get(int(item["server_id"]), [])),
                 }
                 for item in keepalives
@@ -603,15 +767,19 @@ def register(app: FastAPI) -> None:
                 "email": "email" in channels,
                 "webhook": "webhook" in channels,
             },
-            "events": repo.list_events(limit=40),
+            # 概览页的事件窗口，最近 20 条；要翻更早的走 /api/v1/events（可传 limit）
+            "events": repo.list_events(limit=OVERVIEW_EVENT_LIMIT),
         }
 
     @app.post("/api/v1/reconcile")
     def reconcile(request: Request, user: str = Depends(require_admin)):  # noqa: ANN202, ARG001
         require_csrf(request)
         results = engine.reconcile_all()
+        if results is None:
+            # 上一轮还没跑完（后台正忙）：这轮根本没执行，别让前端提示「已触发」。
+            return {"results": [], "busy": True, "dns": []}
         # 手动对账时顺手把 DNS 也过一遍，免得「点了立即对账但域名没跟上」
-        return {"results": results, "dns": dns.reconcile(repo.get_settings())}
+        return {"results": results, "busy": False, "dns": dns.reconcile(repo.get_settings())}
 
     # -- 服务器 ---------------------------------------------------------
     @app.get("/api/v1/servers")
@@ -674,7 +842,15 @@ def register(app: FastAPI) -> None:
     # -- 单机保活 -------------------------------------------------------
     @app.get("/api/v1/keepalives")
     def keepalives(user: str = Depends(require_admin)):  # noqa: ANN202, ARG001
-        return {"items": repo.list_keepalives()}
+        # in_window 给界面用：窗口外机器是停着的，卡片还写「保活运行中」会让人
+        # 以为它该在跑。按后端时区算，和巡检用的是同一条判定。
+        config = repo.get_settings()
+        now = dt.datetime.now(_timezone(config.get("timezone") or "Asia/Shanghai"))
+        items = repo.list_keepalives()
+        for item in items:
+            in_window, _ = keepalive_window(item, now)
+            item["in_window"] = in_window
+        return {"items": items}
 
     @app.post("/api/v1/keepalives")
     def add_keepalive(request: Request, payload: dict[str, Any], user: str = Depends(require_admin)):  # noqa: ANN202, ARG001
@@ -682,7 +858,42 @@ def register(app: FastAPI) -> None:
         server_id = int(payload.get("server_id") or 0)
         if not server_id:
             raise ValueError("请选择服务器")
-        return {"id": repo.add_keepalive(server_id, bool(payload.get("enabled", True)))}
+        start_time, end_time, start_day, end_day = _keepalive_window(payload)
+        return {
+            "id": repo.add_keepalive(
+                server_id,
+                bool(payload.get("enabled", True)),
+                start_time=start_time,
+                end_time=end_time,
+                start_day=start_day,
+                end_day=end_day,
+            )
+        }
+
+    @app.post("/api/v1/keepalives/{keepalive_id}")
+    def update_keepalive(request: Request, keepalive_id: int, payload: dict[str, Any], user: str = Depends(require_admin)):  # noqa: ANN202, ARG001
+        require_csrf(request)
+        if repo.get_keepalive(keepalive_id) is None:
+            raise ValueError("保活任务不存在")
+        start_time, end_time, start_day, end_day = _keepalive_window(payload)
+        repo.update_keepalive(
+            keepalive_id,
+            enabled=bool(payload.get("enabled", True)),
+            start_time=start_time,
+            end_time=end_time,
+            start_day=start_day,
+            end_day=end_day,
+        )
+        # 改了窗口**不清** keepalive_rest：留着它，下一轮巡检看到「已在窗口内」会走
+        # _keepalive_resume_note（安静的窗口恢复）。清掉的话会落到「Stopped 就拉起」，
+        # 被当成抢占恢复，推一条「实例疑被抢占」——那只是用户刚调了时间。
+        # 再打一个 resume_pending 兜住「rest 本来就不存在」的情况（窗口外没停过机）：
+        # 首次拉起同样按窗口恢复处理；实例已是 Running 时巡检会立刻把它清掉。
+        item = repo.get_keepalive(keepalive_id) or {}
+        server_id = int(item.get("server_id") or 0)
+        if server_id:
+            repo.set_flag(f"keepalive_resume_pending:{server_id}")
+        return {"ok": True}
 
     @app.post("/api/v1/keepalives/{keepalive_id}/toggle")
     def toggle_keepalive(request: Request, keepalive_id: int, payload: dict[str, Any], user: str = Depends(require_admin)):  # noqa: ANN202, ARG001
@@ -709,7 +920,9 @@ def register(app: FastAPI) -> None:
     @app.post("/api/v1/groups")
     def save_group(request: Request, payload: dict[str, Any], user: str = Depends(require_admin)):  # noqa: ANN202, ARG001
         require_csrf(request)
-        _validate_group_timetable(payload)
+        # 一月一轮按天排，没有小时边界，时刻表校验（盖满一天）不适用
+        if str(payload.get("cycle") or "day") != "month":
+            _validate_group_timetable(payload)
         is_new = not int(payload.get("id") or 0)
         group_id = repo.upsert_group(payload)
         if not is_new:
@@ -757,7 +970,9 @@ def register(app: FastAPI) -> None:
     def add_dns_record(request: Request, payload: dict[str, Any], user: str = Depends(require_admin)):  # noqa: ANN202, ARG001
         require_csrf(request)
         name = dns.add_record(str(payload.get("record") or ""), repo.get_settings())
-        repo.add_event("dns", "DNS 记录名已添加", name)
+        repo.add_event(
+            "dns", messages.ev("DNS 记录已添加", messages.obj_server(name)), f"已添加 / {name}"
+        )
         return {"record": name}
 
     @app.delete("/api/v1/dns/records/{record}")
@@ -768,7 +983,8 @@ def register(app: FastAPI) -> None:
             raise HTTPException(status_code=404, detail="记录不存在")
         dns.remove_record(record, repo.get_settings())
         repo.add_event(
-            "dns", "DNS 记录名已删除", f"{record}（绑定已一并解除）" if row.get("target_kind") else record
+            "dns", messages.ev("DNS 记录已删除", messages.obj_server(record)),
+            f"已删除 / {record}（绑定已一并解除）" if row.get("target_kind") else f"已删除 / {record}",
         )
         return {"ok": True}
 
@@ -781,7 +997,8 @@ def register(app: FastAPI) -> None:
             raise ValueError("请选择绑定目标")
         config = repo.get_settings()
         dns.sync_registry(config)
-        return dns.bind(record, kind, target_id)
+        # 绑定完立刻同步一次：用户刚把域名指过去，不该等下一轮巡检才生效
+        return dns.bind(record, kind, target_id, config)
 
     @app.post("/api/v1/dns/records/{record}/sync")
     def sync_dns(request: Request, record: str, user: str = Depends(require_admin)):  # noqa: ANN202, ARG001
@@ -809,6 +1026,7 @@ def register(app: FastAPI) -> None:
             "timezone": config.get("timezone"),
             "traffic_threshold_pct": config.get("traffic_threshold_pct"),
             "reconcile_interval": config.get("reconcile_interval"),
+            "reconcile_offset": config.get("reconcile_offset") or "0",
             "billing_enabled": config.get("billing_enabled", "1") == "1",
             "billing_interval": config.get("billing_interval") or "600",
             "daily_report_enabled": config.get("daily_report_enabled") == "1",
@@ -888,6 +1106,11 @@ def register(app: FastAPI) -> None:
             if not 30 <= interval <= 3600:
                 raise ValueError("同步间隔应在 30–3600 秒之间")
             updates["reconcile_interval"] = str(interval)
+        if payload.get("reconcile_offset") is not None:
+            offset = _as_int(payload["reconcile_offset"], "巡检起始秒")
+            if not 0 <= offset <= 59:
+                raise ValueError("巡检起始秒应在 0–59 之间")
+            updates["reconcile_offset"] = str(offset)
 
         put_bool("billing_enabled", payload.get("billing_enabled"))
         if payload.get("billing_interval") is not None:
@@ -897,7 +1120,17 @@ def register(app: FastAPI) -> None:
             updates["billing_interval"] = str(interval)
 
         put_bool("daily_report_enabled", payload.get("daily_report_enabled"))
-        put_str("daily_report_time", payload.get("daily_report_time"))
+        report_time = payload.get("daily_report_time")
+        if report_time is not None:
+            text = str(report_time).strip()
+            if text:
+                # 存进越界值（如 25:00）会让调度线程每轮 now.replace() 抛异常，
+                # 日报从此再也不发 —— 这种值必须在入口挡掉。
+                if not repo.is_hhmm(text):
+                    raise ValueError("日报时间格式应为 HH:MM（00:00–23:59）")
+                hour, minute = (int(part) for part in text.split(":"))
+                text = f"{hour:02d}:{minute:02d}"
+            updates["daily_report_time"] = text
         for key in (
             "notify_on_shift",
             "notify_on_failover",
@@ -926,8 +1159,12 @@ def register(app: FastAPI) -> None:
                     name = str(item or "").strip()
                     if not name or name.lower() in seen:
                         continue
-                    if any(ch.isspace() for ch in name):
-                        raise ValueError(f"DDNS 记录名不能带空格：{name}")
+                    # 和解析层用同一把尺子：不带点的值存进去，ddns.records() 会当它
+                    # 不存在，界面显示「未配置」、DDNS 也静默不动，只在日志里留一句。
+                    if not ddns.is_valid_record(name):
+                        raise ValueError(
+                            f"DDNS 记录名要是完整域名（至少一层点、不带空格）：{name}"
+                        )
                     seen.add(name.lower())
                     cleaned.append(name)
                 updates["ddns_records"] = json.dumps(cleaned, ensure_ascii=False)
@@ -1007,7 +1244,7 @@ def register(app: FastAPI) -> None:
                 # 记录名列表变了，把表里的行同步一遍（增的补上、删的连绑定一起清掉）
                 dns.sync_registry(repo.get_settings())
             if changed:
-                repo.add_event("system", "配置已更新", _setting_labels(changed))
+                repo.add_event("system", messages.ev("配置已更新"), f"已保存 / {_setting_labels(changed)}")
 
         if bumped_epoch is not None:
             # 改用户名 / 改密码的这个浏览器要留住，给它发一张新票据；
@@ -1026,7 +1263,11 @@ def register(app: FastAPI) -> None:
         config = _config_from_draft(payload or {})
         if channel == "ddns":
             result = ddns.test(config)
-            return {"ok": result.status.startswith("✅"), "status": result.status, "detail": result.detail}
+            return {
+                "ok": result.status.startswith("✅"),
+                "status": result.status,
+                "detail": notify.safe_error(result.detail, config),
+            }
 
         if channel not in ("telegram", "email", "webhook"):
             raise ValueError("未知渠道")
@@ -1039,7 +1280,7 @@ def register(app: FastAPI) -> None:
         try:
             notify.send(config, channel, message)
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "detail": str(exc)}
+            return {"ok": False, "detail": notify.safe_error(exc, config)}
         return {"ok": True, "detail": "已发送"}
 
     # -- 事件 -----------------------------------------------------------
