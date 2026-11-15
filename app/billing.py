@@ -19,7 +19,7 @@ import logging
 import time
 from typing import Any
 
-from . import aliyun, repo, settings
+from . import aliyun, messages, repo, settings
 
 log = logging.getLogger("cdt-management.billing")
 
@@ -85,9 +85,12 @@ def refresh_server(server_id: int, *, force: bool = False) -> dict[str, Any] | N
 
     try:
         wallet = aliyun.get_account_balance(server, force=force)
-        balance = float(wallet.get("amount") or 0)
         currency = str(wallet.get("currency") or "")
         detected_site = detected_site or str(wallet.get("site") or "")
+        # 余额统一取 AvailableAmount（可用额度）：现金余额、信控额度、未结清都算在内，
+        # 既对应「现金余额」也对应「可用额度」，不必按站点区分口径。
+        # 后付费账号恒为 0（显示 $0.00），代理商注册的预付费账号有真实余额。
+        balance = float(wallet.get("amount") or 0)
     except Exception as exc:  # noqa: BLE001
         errors.append(str(exc))
         log.warning("账户余额查询失败 server=%s: %s", server_id, exc)
@@ -99,8 +102,9 @@ def refresh_server(server_id: int, *, force: bool = False) -> dict[str, Any] | N
         repo.update_server_site(server_id, detected_site)
         repo.add_event(
             "billing",
-            f"{server.get('label')}：站点已自动纠正",
-            f"{configured_site} → {detected_site}（阿里云返回的站点与配置不一致，费用接口按实际站点走）",
+            messages.ev("站点已自动纠正", messages.obj_server(str(server.get('label') or ''))),
+            f"已纠正 / {configured_site} → {detected_site}"
+            "（阿里云返回的站点与配置不一致，费用接口按实际站点走）",
             server_id=server_id,
         )
         log.info("站点自动纠正 server=%s: %s -> %s", server_id, configured_site, detected_site)
@@ -136,13 +140,17 @@ def refresh_due(now_ts: float | None = None) -> int:
     now = now_ts or time.time()
     refreshed = 0
     bill_ttl = _bill_ttl(config)
+    current_cycle_name = current_cycle(config)
     for server in repo.list_servers():
         if not server.get("secret_configured"):
             continue
         last = float(server.get("billing_updated_at") or 0)
         cycle = str(server.get("billing_cycle") or "")
-        # 跨月立即刷新：上个月的账单数字留着会误导
-        if last and now - last < bill_ttl and cycle == current_cycle(config):
+        # 跨月立即刷新：上个月的账单数字留着会误导。
+        # cycle 为空表示「最近一次没查成」（refresh_server 失败时不写账期），
+        # 这种情况同样要按 TTL 节流 —— 否则缺 BSS 权限的账号每 60 秒就被重打
+        # 一次账单 + 余额，TTL 形同不存在。
+        if last and now - last < bill_ttl and cycle in ("", current_cycle_name):
             continue
         try:
             if refresh_server(int(server["id"])) is not None:
@@ -164,7 +172,7 @@ def _mark_transition(server: dict[str, Any], error_text: str) -> None:
     if now_error:
         repo.add_event(
             "error",
-            f"{server.get('label')}：费用查询失败",
+            messages.ev("费用查询失败", messages.obj_server(str(server.get('label') or ''))),
             f"{error_text}（缺 BSS 权限时可在设置里关闭费用查询）",
             level="warning",
             server_id=int(server["id"]),
@@ -172,8 +180,8 @@ def _mark_transition(server: dict[str, Any], error_text: str) -> None:
     else:
         repo.add_event(
             "billing",
-            f"{server.get('label')}：费用已恢复",
-            "账单与余额查询恢复正常",
+            messages.ev("费用已恢复", messages.obj_server(str(server.get('label') or ''))),
+            "已恢复 / 账单与余额查询正常",
             server_id=int(server["id"]),
         )
 
