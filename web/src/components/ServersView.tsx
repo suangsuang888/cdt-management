@@ -18,8 +18,10 @@ import {
   Trash2,
 } from 'lucide-react'
 import { regionLabel } from '../regions'
+import { ownerBase, ownerLabel } from '../owners'
+import { clockText } from '../time'
 import type { Billing, Server } from '../types'
-import { Badge, Empty, Meter, statusLabel, statusTone, stoppedModeLabel } from './ui'
+import { Badge, Empty, Meter, money, statusLabel, statusTone, stoppedModeLabel } from './ui'
 
 type Props = {
   servers: Server[]
@@ -79,7 +81,9 @@ export default function ServersView({
       return
     }
     const [moved] = next.splice(from, 1)
-    next.splice(to, 0, moved)
+    // 向下拖时 to 是删除前算的：先 splice 掉 from，目标整体左移一位，
+    // 直接插到 to 会落在目标后面（差一格）。向上拖不受影响。
+    next.splice(from < to ? to - 1 : to, 0, moved)
     onReorder(next.map((server) => server.id))
     setDragId(null)
     setOverId(null)
@@ -89,7 +93,7 @@ export default function ServersView({
     <>
       <div className="page-head">
         <div>
-          <h1>服务器</h1>
+          <h1>实例管理</h1>
           <p>
             这里登记的是「阿里云账号 + 一台 ECS 实例」。AccessKey Secret 用本机主密钥加密后存
             SQLite，界面上不显示，只在编辑弹窗里能换。
@@ -118,14 +122,14 @@ export default function ServersView({
             </div>
           )}
           <button className="btn primary" onClick={onAdd}>
-            <Plus size={14} /> 添加服务器
+            <Plus size={14} /> 添加实例
           </button>
         </div>
       </div>
 
       {servers.length === 0 ? (
         <div className="card">
-          <Empty icon={<ServerIcon size={20} />} title="还没有服务器">
+          <Empty icon={<ServerIcon size={20} />} title="还没有实例">
             添加后可以把它放进「单机保活」或「联合换班」。建议使用只授予 ECS 启停/查询与 CDT
             只读权限的 RAM 子账号。
           </Empty>
@@ -149,17 +153,13 @@ export default function ServersView({
             const owner = server.managed ?? null
             const busy = busyId === server.id
             const locked = Boolean(owner?.active)
-            const ownerText =
-              owner?.kind === 'group'
-                ? `换班组「${owner.name}」`
-                : owner?.kind === 'keepalive'
-                  ? '单机保活'
-                  : ''
-            const lockHint = locked
-              ? `${ownerText}托管中，先暂停或移出后再手动启停`
-              : running
-                ? '关机（优先节省停机，不支持时转普通停机）'
-                : '开机'
+            const ownerText = owner ? ownerLabel(owner) : ''
+            const lockHint =
+              owner && locked
+                ? `${ownerBase(owner)}托管中，先暂停或移出后再手动启停`
+                : running
+                  ? '关机（优先节省停机，不支持时转普通停机）'
+                  : '开机'
 
             return (
               <div
@@ -223,19 +223,25 @@ export default function ServersView({
                   </div>
                 </div>
 
+                {/* 身份行①：实例 ID 靠左，站点类型靠右 */}
                 <div className="meta-line">
-                  <code style={{ fontSize: 11 }}>{server.instance_id || '未填实例 ID'}</code>
-                </div>
-                <div className="meta-line">
-                  <span className="card-region" title={server.region_id}>
-                    <MapPin size={11} />
-                    {regionLabel(server.region_id)}
-                  </span>
-                  <span className={`site-tag ${server.site === 'international' ? 'intl' : ''}`}>
+                  <code style={{ fontSize: 12 }} title={server.instance_id}>
+                    {server.instance_id || '未填实例 ID'}
+                  </code>
+                  <span
+                    className={`site-tag meta-right ${server.site === 'international' ? 'intl' : ''}`}
+                  >
                     {server.site === 'international' ? '国际站' : '中国站'}
                   </span>
-                  <span className="card-ip" title="公网 IP">
+                </div>
+                {/* 身份行②：公网 IP 靠左，地域靠右 */}
+                <div className="meta-line">
+                  <span className="addr-chip" title="公网 IP">
                     {server.public_ip || '无公网 IP'}
+                  </span>
+                  <span className="card-region meta-right" title={server.region_id}>
+                    <MapPin size={11} />
+                    {regionLabel(server.region_id)}
                   </span>
                 </div>
 
@@ -253,12 +259,12 @@ export default function ServersView({
 
                 {server.instance_status === 'Stopped' &&
                   stoppedModeLabel(server.stopped_mode) === '普通停机' && (
-                    <div style={{ fontSize: 11, color: 'var(--amber)' }}>
+                    <div style={{ fontSize: 12, color: 'var(--amber)' }}>
                       普通停机（KeepCharging）仍计实例规格费
                     </div>
                   )}
                 {server.remark && (
-                  <div style={{ fontSize: 11.5, color: 'var(--muted-soft)' }}>{server.remark}</div>
+                  <div style={{ fontSize: 12, color: 'var(--muted-soft)' }}>{server.remark}</div>
                 )}
 
                 <div className="card-foot">
@@ -266,13 +272,10 @@ export default function ServersView({
                     {owner ? (
                       <>
                         {owner.kind === 'group' ? <Repeat size={10} /> : <HeartPulse size={10} />}
-                        <span className="owner-tag-text">
-                          {ownerText}
-                          {locked ? '托管' : '已暂停'}
-                        </span>
+                        <span className="owner-tag-text">{ownerText}</span>
                       </>
                     ) : (
-                      <>闲散 · 手动</>
+                      <>闲散手动</>
                     )}
                   </span>
                   {dnsRecords(server.dns_record).map((record) => (
@@ -314,7 +317,7 @@ export default function ServersView({
   )
 }
 
-/** 表格视图：一屏看全所有服务器的核心字段，适合机器多的时候快速对比 */
+/** 表格视图：一屏看全所有实例的核心字段，适合机器多的时候快速对比 */
 function ServerTable({
   servers,
   busyId,
@@ -339,27 +342,18 @@ function ServerTable({
   return (
     <div className="card server-table-card">
       <table className="server-table">
-        <colgroup>
-          <col style={{ width: '13%' }} />
-          <col style={{ width: '10%' }} />
-          <col style={{ width: '8%' }} />
-          <col style={{ width: '9%' }} />
-          <col style={{ width: '9%' }} />
-          <col style={{ width: '12%' }} />
-          <col style={{ width: '13%' }} />
-          <col style={{ width: '15%' }} />
-          <col style={{ width: '11%' }} />
-        </colgroup>
+        {/* 8 列：公网 IP 与域名并成一列（都是「怎么连上这台机器」的信息，上下两行比并排省一整列）。
+            列宽不再写死百分比 —— 定宽布局下 9 列挤在 1100 上下时每一列都会被省略号切掉，
+            改成按内容自然分配（见 styles.css 里 .server-table 的说明） */}
         <thead>
           <tr>
-            <th>服务器 / 实例 ID</th>
+            <th>实例 / 实例 ID</th>
             <th>状态</th>
-            <th>地域 / 站点</th>
-            <th>公网 IP</th>
+            <th>站点 / 地域</th>
+            <th>IP / 域名</th>
             <th>流量 / 配额</th>
             <th>本月 / 余额</th>
             <th>归属</th>
-            <th>域名</th>
             <th style={{ textAlign: 'right' }}>操作</th>
           </tr>
         </thead>
@@ -369,15 +363,10 @@ function ServerTable({
             const owner = server.managed ?? null
             const busy = busyId === server.id
             const locked = Boolean(owner?.active)
-            const ownerText =
-              owner?.kind === 'group'
-                ? `换班「${owner.name}」${locked ? '托管' : '已暂停'}`
-                : owner?.kind === 'keepalive'
-                  ? `保活${locked ? '托管' : '已暂停'}`
-                  : '闲散 · 手动'
+            const ownerText = ownerLabel(owner)
             return (
               <tr key={server.id}>
-                <td data-label="服务器">
+                <td data-label="实例">
                   <div className="server-table-title" title={server.label}>
                     {server.label}
                   </div>
@@ -386,23 +375,51 @@ function ServerTable({
                   </code>
                 </td>
                 <td data-label="状态">
-                  <Badge tone={statusTone(server.instance_status)} pulse={running}>
-                    {statusLabel(server.instance_status, server.stopped_mode)}
-                  </Badge>
+                  {/* 状态与停机模式拆成两行：并排塞进一枚胶囊时「已停机 · 节省停机」
+                      比整列还宽，会溢出压到右边的站点/地域列上 */}
+                  <div className="server-table-status">
+                    <Badge tone={statusTone(server.instance_status)} pulse={running}>
+                      {statusLabel(server.instance_status)}
+                    </Badge>
+                    {server.instance_status === 'Stopped' && stoppedModeLabel(server.stopped_mode) && (
+                      <span className="server-table-status-sub">
+                        {stoppedModeLabel(server.stopped_mode)}
+                      </span>
+                    )}
+                  </div>
                 </td>
-                <td data-label="地域">
+                <td data-label="站点 / 地域">
                   <div className="server-table-region">
-                    <span className="server-table-cell">
-                      <MapPin size={11} />
-                      {regionLabel(server.region_id)}
-                    </span>
                     <span className={`site-tag ${server.site === 'international' ? 'intl' : ''}`}>
                       {server.site === 'international' ? '国际' : '中国'}
                     </span>
+                    <span className="server-table-cell">
+                      <MapPin size={11} />
+                      {/* 地域名长度不一（中国香港 / 日本（东京）），列一窄就会顶到右边的公网 IP 上，
+                          这里交给省略号收尾，完整名字放 title */}
+                      <span className="server-table-cell-text" title={regionLabel(server.region_id)}>
+                        {regionLabel(server.region_id)}
+                      </span>
+                    </span>
                   </div>
                 </td>
-                <td data-label="公网 IP">
-                  <span className="server-table-mono">{server.public_ip || '—'}</span>
+                <td data-label="IP / 域名">
+                  {/* 两行：上面公网 IP（这一行永远是重点），下面域名（没绑就是一条横杠）。
+                      并成一列后横向省下约 120px，正好让给左边的实例名。
+                      data-label 比表头的「IP / 域名」短一截 —— 手机上标签只有 68px，长了会压到数值 */}
+                  <div className="server-table-net">
+                    <span className="addr-chip">{server.public_ip || '—'}</span>
+                    <div className="server-table-dns">
+                      {/* 与卡片同一套数据：换班组绑定的域名只出现在当班那台 */}
+                      {dnsRecords(server.dns_record).map((record) => (
+                        <span className="dns-chip" key={record} title={record}>
+                          <Globe2 size={10} />
+                          <span className="dns-chip-text">{record}</span>
+                        </span>
+                      ))}
+                      {!server.dns_record && <span className="server-table-muted">—</span>}
+                    </div>
+                  </div>
                 </td>
                 <td data-label="流量 / 配额">
                   <div className="server-table-meter">
@@ -434,21 +451,9 @@ function ServerTable({
                         <span className="owner-tag-text">{ownerText}</span>
                       </>
                     ) : (
-                      <>闲散 · 手动</>
+                      <>闲散手动</>
                     )}
                   </span>
-                </td>
-                <td data-label="域名">
-                  {/* 与卡片同一套数据：换班组绑定的域名只出现在当班那台 */}
-                  <div className="server-table-dns">
-                    {dnsRecords(server.dns_record).map((record) => (
-                      <span className="dns-chip" key={record} title={record}>
-                        <Globe2 size={10} />
-                        <span className="dns-chip-text">{record}</span>
-                      </span>
-                    ))}
-                    {!server.dns_record && <span className="server-table-muted">—</span>}
-                  </div>
                 </td>
                 <td data-label="操作">
                   <div className="server-table-actions">
@@ -473,6 +478,13 @@ function ServerTable({
                       </button>
                     )}
                     <button
+                      className="btn ghost icon sm"
+                      title="删除"
+                      onClick={() => onDelete(server)}
+                    >
+                      <Trash2 size={13} style={{ color: 'var(--red)' }} />
+                    </button>
+                    <button
                       className={`btn sm ${running ? 'danger' : 'primary'}`}
                       title={locked ? '托管中，先移出再启停' : running ? '关机' : '开机'}
                       disabled={locked || busy}
@@ -487,13 +499,6 @@ function ServerTable({
                       )}
                       {running ? '关机' : '开机'}
                     </button>
-                    <button
-                      className="btn ghost icon sm"
-                      title="删除"
-                      onClick={() => onDelete(server)}
-                    >
-                      <Trash2 size={13} style={{ color: 'var(--red)' }} />
-                    </button>
                   </div>
                 </td>
               </tr>
@@ -505,19 +510,9 @@ function ServerTable({
   )
 }
 
-const CURRENCY_SIGN: Record<string, string> = {
-  CNY: '¥',
-  USD: '$',
-  HKD: 'HK$',
-  JPY: 'JP¥',
-  EUR: '€',
-  GBP: '£',
-}
-
-function money(value: number | null, currency: string): string {
-  if (value === null || Number.isNaN(value)) return '—'
-  const sign = CURRENCY_SIGN[currency] ?? `${currency} `
-  return `${sign}${value.toFixed(2)}`
+/** 余额直接显示 BSS 返回的 AvailableAmount（国际站后付费恒 0，代理商预付费有真实余额）。 */
+function balanceText(billing: Billing): string {
+  return money(billing.balance, billing.currency)
 }
 
 /** 本月账单 + 账户余额。数据来自 BSS，后台每 30 分钟刷一次，这里只负责展示。 */
@@ -536,10 +531,7 @@ function CostRow({
   const hint = failed
     ? `费用查询失败：${billing.error}`
     : billing.updated_at
-      ? `更新于 ${new Date(billing.updated_at * 1000).toLocaleTimeString('zh-CN', {
-          hour: '2-digit',
-          minute: '2-digit',
-        })}`
+      ? `更新于 ${clockText(billing.updated_at)}`
       : '还没有查询过'
 
   if (compact) {
@@ -554,7 +546,7 @@ function CostRow({
         <span className="cost-item">
           <span className="cost-key">余额</span>
           <b className={billing.balance === null ? 'dim' : ''}>
-            {money(billing.balance, billing.currency)}
+            {balanceText(billing)}
           </b>
         </span>
         {failed && (
@@ -589,7 +581,7 @@ function CostRow({
       <span className="cost-item" title={hint}>
         <span className="cost-key">余额</span>
         <b className={billing.balance === null ? 'dim' : ''}>
-          {money(billing.balance, billing.currency)}
+          {balanceText(billing)}
         </b>
       </span>
       {failed && (
