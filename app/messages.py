@@ -13,7 +13,7 @@
 不按脚本写死「Stopped (StopCharging)」——普通停机照常收规格费，写错会误导。
 
 唯一在脚本之外统一加的一行是「📍 地域」：跟着 ＩＰ 行的下一行，取 ECS DescribeInstances
-返回的真实 RegionId（如 cn-hongkong），和每日流量报告字段顺序一致。其余字段位置不动。
+返回的真实 RegionId（如 cn-hongkong），和每日报告字段顺序一致。其余字段位置不动。
 
 本模块只做拼装，不查库、不调接口，方便和脚本对着看。
 """
@@ -46,6 +46,16 @@ def mode_label(mode: str | None) -> str:
     return MODE_LABELS.get(mode, mode) if mode else ""
 
 
+def stop_phrase(mode: str | None, prefix: str = "已") -> str:
+    """「已节省停机 / 已普通停机」，模式读不到就退成「已停机」。
+
+    有规格不支持节省停机，`stop_instance` 会 fallback 成普通停机（照常收规格费）。
+    文案跟着**实际生效**的模式走，否则通知里说「已节省停机」而账单照扣，是骗人。
+    """
+    label = mode_label(mode)
+    return f"{prefix}{label}" if label else f"{prefix}停机"
+
+
 # 实例状态的中文说法，事件进度文案用（Running 到位 = 运行中；停机到位 = 真实停机模式）。
 STATUS_LABELS = {
     "Running": "运行中",
@@ -76,12 +86,38 @@ def status_suffix(status: str | None, stopped_mode: str | None) -> str:
     return f"（{label}）" if label else ""
 
 
+def result_label(status: str | None, stopped_mode: str | None) -> str:
+    """事件概览首段的「结果」短语：只讲最后落在什么状态，不带过程。
+
+    - Running → 运行中
+    - Stopped → 已停止（节省停机 / 普通停机），无模式时「已停止」
+    - 其他 → 通用状态中文（启动中 / 停止中 …），未知值原样返回
+
+    和 status_suffix 的区别：后缀是给「已确认 Running（运行中）」这种过程句用的，
+    这里是概览摘要的主语，读起来要能独立成句。
+    """
+    status = str(status or "").strip()
+    if not status:
+        return "已完成"
+    if status == "Running":
+        return "运行中"
+    if status == "Stopped":
+        label = mode_label(stopped_mode)
+        return f"已停止（{label}）" if label else "已停止"
+    return STATUS_LABELS.get(status) or status
+
+
 def stop_tail(servers: list[dict[str, Any]]) -> str:
     """一句话说明这批机器到底是怎么停的，按实例返回的真实 StoppedMode。"""
     modes = {_mode(s) for s in servers}
+    # _mode 读不到模式时给的是「-」而不是空串，不排掉就会写出「均已-」这种车祸。
+    # 有机器模式读不到就不猜，退成「均已停机」——说「均已节省停机」而实际照扣
+    # 规格费比含糊更糟。
+    if "-" in modes or "" in modes:
+        return "均已停机"
     if modes == {"StopCharging"}:
         return "均已节省停机"
-    if len(modes) == 1 and "" not in modes:
+    if len(modes) == 1:
         return f"均已{mode_label(next(iter(modes)))}"
     return "均已停机"
 
@@ -124,13 +160,114 @@ def _status(server: dict[str, Any]) -> str:
     return f"{status} ({mode})" if mode and mode != "-" else status
 
 
+def _state_icon(server: dict[str, Any]) -> str:
+    """状态行图标：运行中 🟢，其余（停机 / 中间态）⚪。
+
+    换班异常报告里当班「应当运行」却超时未就绪，停机的那台该 ⚪；
+    应当停止的那台若还赖在 Running，该 🟢。写死 🚧 会让图标和状态文字打架。
+    """
+    return "🟢" if str(server.get("instance_status") or "") == "Running" else "⚪"
+
+
 def _used(server: dict[str, Any]) -> float:
     return float(server.get("traffic_used") or 0)
+
+
+def _threshold_text(server: dict[str, Any]) -> str:
+    """阈值取这台机器自己在服务器设置里填的 threshold_gb，不是组里共用的那个。
+
+    每台机器的套餐和阈值可以不一样，用组阈值会张冠李戴。
+    没填（0 或缺失）时返回空串，调用方就别写括号 —— 「阈值 0 GB」比不写更糟。
+    """
+    try:
+        value = float(server.get("threshold_gb") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _used_line(server: dict[str, Any]) -> str:
+    """「已用」行带上这台机器自己的阈值，一眼能看出超了多少。"""
+    line = f"┃ 📈 已用：{_used(server):.2f} GB"
+    threshold = _threshold_text(server)
+    return f"{line}（阈值 {threshold} GB）" if threshold else line
+
+
+# --------------------------------------------------------------------------
+# 标题：CDT {事件}报告（{范围}）
+# --------------------------------------------------------------------------
+# 三种托管范围，标题末尾永远带一个全角括号说明「这条报告属于谁」：
+#   换班组   → （换班组：港新联合保活）
+#   单机保活 → （单机保活）
+#   闲散手动 → （闲散手动）
+# 统一之后，推送列表里一眼能认出事件归属，不用去点开正文。
+SCOPE_GROUP = "换班组"
+SCOPE_KEEPALIVE = "单机保活"
+SCOPE_IDLE = "闲散手动"
+
+
+def scope_tag(group_name: str = "", scope: str = SCOPE_GROUP, note: str = "") -> str:
+    """标题末尾的范围括号。
+
+    note 是给同一事件补的修饰（目前只有「延迟恢复」），跟在范围后面共用
+    一个括号：`（换班组：X，延迟恢复）`。排两个括号看着像两件事。
+    """
+    inner = f"{SCOPE_GROUP}：{group_name}" if group_name else (scope or SCOPE_GROUP)
+    if note:
+        inner = f"{inner}，{note}"
+    return f"（{inner}）"
+
+
+def title_of(
+    event: str,
+    group_name: str = "",
+    scope: str = SCOPE_GROUP,
+    note: str = "",
+) -> str:
+    """统一拼标题。event 不带「报告」二字，例如「换班完成」「全局熔断」。"""
+    return f"CDT {event}报告{scope_tag(group_name, scope, note)}"
+
+
+# --------------------------------------------------------------------------
+# 事件标题：{结论}（{对象}）
+# --------------------------------------------------------------------------
+# 与通知标题同构 —— 结论在前、对象进括号，扫列表时先看「发生了什么」，
+# 需要再确认「是谁」。结论里不再重复对象名，也不再用「对象：结论」的写法：
+# 以前「别名：保活拉起完成」和「别名 状态读取已恢复」两种写法混在一起，
+# 名字长短一变，结论就没法对齐，列表看着很乱。
+def ev(conclusion: str, obj: str = "") -> str:
+    """事件标题。obj 为空时按系统级事件处理，写成「（系统）」。"""
+    return f"{conclusion}（{obj or '系统'}）"
+
+
+def obj_server(label: str) -> str:
+    """单台服务器：裸别名。换班组才带前缀，避免与同名实例混淆。"""
+    return str(label or "—")
+
+
+def obj_group(name: str) -> str:
+    return f"{SCOPE_GROUP}：{name or '—'}"
+
+
+def obj_duty(name: str, label: str) -> str:
+    """换班组里的当班机：点名到具体实例，一眼看出是谁出问题。"""
+    return f"{SCOPE_GROUP}：{name or '—'}，当班 {label or '—'}"
+
+
+def obj_member(name: str, label: str) -> str:
+    return f"{SCOPE_GROUP}：{name or '—'}，成员 {label or '—'}"
 
 
 def _message(kind: str, title_html: str, title: str, body: str) -> notify.Message:
     raw = f"{title_html}\n\n{body}"
     return notify.Message(kind=kind, title=title, html=raw, text=_TAG_RE.sub("", raw))
+
+
+def _titled(kind: str, emoji: str, title: str, body: str) -> notify.Message:
+    """标题只写一份：html 版加 emoji 与 <b>，text 版用纯文本，省得两处改漏。"""
+    return _message(kind, f"{emoji} <b>{title}</b>", title, body)
 
 
 # --------------------------------------------------------------------------
@@ -244,34 +381,25 @@ def shift_done(
     delayed: bool = False,
     manual: bool = False,
 ) -> notify.Message:
-    """✅ 换班完成 / 换班成功（延迟恢复）/ 换班完成（手动换班）。
+    """✅ 换班完成 / 换班成功（延迟恢复）/ 手动换班完成。
 
-    手动换班走完整流程（确认成员状态 → DDNS → 结算），报告照发，只在标题
-    加后缀区分来源，不让人误以为是自动换班或故障转移。
+    手动换班走完整流程（确认成员状态 → DDNS → 结算），报告照发，事件名改成
+    「手动换班完成」而不是加后缀 —— 标题统一为 `CDT {事件}报告（范围）` 之后，
+    后缀那一串只能塞进范围括号里，读起来像范围本身有毛病。
     """
-    prefix = f"{group_name} " if group_name else ""
-    if delayed:
-        return _message(
-            "shift_done",
-            f"✅ <b>CDT {prefix}换班成功报告 (延迟恢复)</b>",
-            f"CDT {prefix}换班成功报告 (延迟恢复)",
-            f"🕒 <b>当前班次</b>：{period}\n{SEP}\n"
-            + _join_blocks(
-                [running_block("运行账号", duty, ddns_status)]
-                + [stopped_block("停止账号", s, _status(s)) for s in stopped]
-            ),
-        )
-    title = f"CDT {prefix}换班完成报告(手动换班)" if manual else f"CDT {prefix}换班完成报告"
-    return _message(
-        "shift_done",
-        f"✅ <b>{title}</b>",
-        title,
-        f"🕒 <b>当前班次</b>：{period}\n{SEP}\n"
-        + _join_blocks(
-            [running_block("运行账号", duty, ddns_status)]
-            + [stopped_block("停止账号", s, _status(s)) for s in stopped]
-        ),
+    body = f"🕒 <b>当前班次</b>：{period}\n{SEP}\n" + _join_blocks(
+        [running_block("运行账号", duty, ddns_status)]
+        + [stopped_block("停止账号", s, _status(s)) for s in stopped]
     )
+    if delayed:
+        return _titled(
+            "shift_done",
+            "✅",
+            title_of("换班成功", group_name, note="延迟恢复"),
+            body,
+        )
+    event = "手动换班完成" if manual else "换班完成"
+    return _titled("shift_done", "✅", title_of(event, group_name), body)
 
 
 def shift_failover(
@@ -280,17 +408,30 @@ def shift_failover(
     standby: list[dict[str, Any]],
     ddns_status: str,
     group_name: str = "",
+    reason: str = "traffic",
 ) -> notify.Message:
-    """⚠️ 故障转移（原「临时换班」）。两块是脚本原样，三台以上才补「停止账号」。"""
-    prefix = f"{group_name} " if group_name else ""
+    """⚠️ 故障转移（原「临时换班」）。两块是脚本原样，三台以上才补「停止账号」。
+
+    reason 决定「为什么换人」：
+      - traffic（默认）：当班流量到阈值，换一台没超的；
+      - stall：当班被抢占后拉不起来、或启动卡住，换一台顶这一班。
+
+    两者共用同一个状态机和同一条事件类型，只是原因和「被接管账号」的叫法不同：
+    起不来的机器谈不上「超限」，还写「超限账号」会把人往流量方向带偏。
+    """
+    stall = reason == "stall"
+    # 起不来的原因不可穷举（库存不足、竞价失败、被回收没及时回来都长得一样），
+    # 所以写「疑被抢占」而不是断言「被抢占」——把话留一点，别让通知替阿里云下结论。
+    cause = "当班实例疑被抢占，保活超时" if stall else "当班实例流量超限"
+    taken_label = "离线账号" if stall else "超限账号"
     parts = [running_block("接替账号", duty, ddns_status)]
-    parts += [stopped_block("超限账号", s, _status(s), used=_used(s)) for s in over]
+    parts += [stopped_block(taken_label, s, _status(s), used=_used(s)) for s in over]
     parts += [stopped_block("停止账号", s, _status(s)) for s in standby]
-    return _message(
+    return _titled(
         "shift_failover",
-        f"⚠️ <b>CDT {prefix}故障转移报告</b>",
-        f"CDT {prefix}故障转移报告",
-        f"📢 <b>故障转移</b>：当班实例流量超限，已启用备用实例。\n{SEP}\n" + _join_blocks(parts),
+        "⚠️",
+        title_of("故障转移", group_name),
+        f"📢 <b>故障转移</b>：{cause}，已启用备用实例。\n{SEP}\n" + _join_blocks(parts),
     )
 
 
@@ -305,7 +446,6 @@ def breaker(
     note 非空表示「不是因为全员超限、而是找不到替班」（其他成员状态读不到）：
     此时我们并不知道别人用了多少流量，不能照抄「N 台流量均已到达到阈值」。
     """
-    prefix = f"{group_name} " if group_name else ""
     count = "双实例" if len(servers) == 2 else f"{len(servers)} 台实例"
     if note:
         warn = f"当班流量已到达到阈值，{note}，按“全局熔断”处理，{stop_tail(servers)}。"
@@ -316,43 +456,84 @@ def breaker(
             [
                 f"🖥 {_label(s)}",
                 f"┃ 📦 实例：<code>{_instance(s)}</code>",
+                f"┃ 🌐 ＩＰ：{_ip(s)}",
                 f"┃ 📍 地域：{_region(s)}",
-                f"┃ 📈 已用：{_used(s):.2f} GB",
-                f"┃ 🚧 状态：{_status(s)}",
+                _used_line(s),
+                f"┃ {_state_icon(s)} 状态：{_status(s)}",
             ]
         )
         for s in servers
     ]
-    return _message(
+    return _titled(
         "breaker",
-        f"🚨 <b>CDT {prefix}全局熔断报告</b>",
-        f"CDT {prefix}全局熔断报告",
+        "🚨",
+        title_of("全局熔断", group_name),
         f"⚠ <b>警告：{warn}</b>\n\n" + _join_blocks(blocks),
     )
 
 
-def limit_stop(server: dict[str, Any], group_name: str = "") -> notify.Message:
+def limit_stop(
+    server: dict[str, Any], group_name: str = "", mode: str | None = None
+) -> notify.Message:
     """🚨 全局熔断（单台场景）：当班超限，这台机器只停它自己。
 
     两种情况：组里关掉了「允许流量故障转移」，或当班自身状态都读不到、无从判断。
     和 breaker() 共用同一个标题「全局熔断报告」——两者都是「流量到阈值被迫停机」，
     只是范围不同（单台 / 全组），分两个标题在推送里只会让人以为是两件事。
     正文保留 ＩＰ 行，与其它通知的实例块字段顺序一致。
+
+    停机措辞按 mode（缺省取实例自己的 StoppedMode）：不支持节省停机的规格会
+    fallback 成普通停机，照常收规格费，不能一律写「已节省停机」。
     """
-    prefix = f"{group_name} " if group_name else ""
-    return _message(
+    stopped = stop_phrase(mode if mode is not None else server.get("stopped_mode"), "已强制")
+    return _titled(
         "limit_stop",
-        f"🚨 <b>CDT {prefix}全局熔断报告</b>",
-        f"CDT {prefix}全局熔断报告",
+        "🚨",
+        title_of("全局熔断", group_name),
         "\n".join(
             [
-                "当班实例流量超限，已强制节省停机。",
+                f"当班实例流量超限，该换班组没有启用故障转移，{stopped}。",
+                "如有需要，请开启故障转移或者去管理后台手动点击“立即换班”。",
                 "",
                 f"🖥 {_label(server)}",
                 f"┃ 📦 实例：<code>{_instance(server)}</code>",
                 f"┃ 🌐 ＩＰ：{_ip(server)}",
                 f"┃ 📍 地域：{_region(server)}",
-                f"┃ 🔴 状态：{_status(server)}",
+                _used_line(server),
+                f"┃ {_state_icon(server)} 状态：{_status(server)}",
+                SEP,
+            ]
+        ),
+    )
+
+
+def over_limit(server: dict[str, Any], scope: str, mode: str | None = None) -> notify.Message:
+    """🚨 超限停机：单机保活 / 闲散手动的机器到阈值，被迫停机。
+
+    标题不叫「全局熔断」——那套说的是换班组里「没得换所以全停」，单机场景
+    底下没有「全局」可言，混用会让人以为换班组出了事。范围括号标明是谁被停了。
+
+    停机措辞同样按实际生效的模式走（见 limit_stop）。
+    """
+    # 单机保活除了停机还要暂停保活，但停机模式同样必须写出来：只写「已暂停保活」，
+    # 用户看不出这台是省钱停了还是照常计费，和事件标题「流量超限，已节省停机」也对不上。
+    stopped = stop_phrase(mode if mode is not None else server.get("stopped_mode"))
+    paused = f"{stopped}，并暂停保活" if scope == SCOPE_KEEPALIVE else stopped
+    return _titled(
+        "limit_stop",
+        "🚨",
+        title_of("超限停机", scope=scope),
+        "\n".join(
+            [
+                f"流量已到阈值，{paused}，不再自动开机。",
+                "流量回落到阈值以下（流量包重置或调高阈值）后自动恢复。",
+                "",
+                f"🖥 {_label(server)}",
+                f"┃ 📦 实例：<code>{_instance(server)}</code>",
+                f"┃ 🌐 ＩＰ：{_ip(server)}",
+                f"┃ 📍 地域：{_region(server)}",
+                _used_line(server),
+                f"┃ {_state_icon(server)} 状态：{_status(server)}",
                 SEP,
             ]
         ),
@@ -364,15 +545,17 @@ def recovery(
     ddns_status: str,
     headline: str = "当班实例疑被抢占，已自动恢复运行。",
     kind: str = "recovery",
+    group_name: str = "",
 ) -> notify.Message:
     """🟢 抢占恢复。单机保活拉起也用这套版式（脚本里没有单独的保活通知）。
 
-    标题靠后缀区分来源，正文一致：单机保活「CDT 抢占恢复报告(单机保活)」、
-    联合换班「CDT 抢占恢复报告(联合换班)」。之前联合换班把组名塞在标题里、
-    单机保活没有前缀，两个标题长得太像，不好认。
+    范围靠标题括号区分：单机保活「（单机保活）」、换班组「（换班组：组名）」。
+    之前联合换班把组名塞在事件名前面、单机保活没有前缀，两个标题长得太像，不好认。
     """
-    scope = "单机保活" if kind == "keepalive" else "联合换班"
-    title = f"CDT 抢占恢复报告({scope})"
+    if kind == "keepalive":
+        title = title_of("抢占恢复", scope=SCOPE_KEEPALIVE)
+    else:
+        title = title_of("抢占恢复", group_name)
     lines = [
         headline,
         "",
@@ -384,7 +567,7 @@ def recovery(
         "┃ 🟢 状态：Running",
         SEP,
     ]
-    return _message(kind, f"🟢 <b>{title}</b>", title, "\n".join(lines))
+    return _titled(kind, "🟢", title, "\n".join(lines))
 
 
 def shift_error(
@@ -392,21 +575,25 @@ def shift_error(
     stopped: list[dict[str, Any]],
     minutes: int,
     group_name: str = "",
+    ddns_status: str = "",
 ) -> notify.Message:
-    """⚠️ 换班异常（超时未就绪）。"""
-    prefix = f"{group_name} " if group_name else ""
-    parts = [
-        "\n".join(
-            [
-                "🚩 <b>应当运行账号 </b>",
-                f"┃ 🏷 别名：{_label(duty)}",
-                f"┃ 📦 实例：<code>{_instance(duty)}</code>",
-                f"┃ 🌐 ＩＰ：{_ip(duty)}",
-                f"┃ 📍 地域：{_region(duty)}",
-                f"┃ 🚧 状态：{_status(duty)}",
-            ]
-        )
+    """⚠️ 换班异常（超时未就绪）。
+
+    ddns_status 与其它换班报告取同一套文案（`✅ 已同步` / `❌ 更新失败`），
+    只挂在「应当运行账号」那台上 —— 域名本来就该指向它。异常时这一行尤其有用：
+    用户不用切到 DNS 页就知道解析此刻有没有跟着走。
+    """
+    duty_lines = [
+        "🚩 <b>应当运行账号 </b>",
+        f"┃ 🏷 别名：{_label(duty)}",
+        f"┃ 📦 实例：<code>{_instance(duty)}</code>",
+        f"┃ 🌐 ＩＰ：{_ip(duty)}",
+        f"┃ 📍 地域：{_region(duty)}",
     ]
+    if ddns_status:
+        duty_lines.append(f"┃ ☁️ DDNS：{ddns_status}")
+    duty_lines.append(f"┃ {_state_icon(duty)} 状态：{_status(duty)}")
+    parts = ["\n".join(duty_lines)]
     for server in stopped:
         parts.append(
             "\n".join(
@@ -416,17 +603,53 @@ def shift_error(
                     f"┃ 📦 实例：<code>{_instance(server)}</code>",
                     f"┃ 🌐 ＩＰ：{_ip(server)}",
                     f"┃ 📍 地域：{_region(server)}",
-                    f"┃ 🚧 状态：{_status(server)}",
+                    f"┃ {_state_icon(server)} 状态：{_status(server)}",
                 ]
             )
         )
-    return _message(
+    return _titled(
         "shift_error",
-        f"⚠️ <b>CDT {prefix}换班异常报告</b>",
-        f"CDT {prefix}换班异常报告",
+        "⚠️",
+        title_of("换班异常", group_name),
         f"⏳ <b>换班超时：换班指令已执行 {minutes} 分钟，但状态未就绪。</b>\n\n"
         + _join_blocks(parts),
     )
+
+
+CURRENCY_SIGNS = {
+    "CNY": "¥",
+    "USD": "$",
+    "HKD": "HK$",
+    "JPY": "JP¥",
+    "EUR": "€",
+    "GBP": "£",
+}
+
+
+def _currency_sign(currency: str | None) -> str:
+    """货币代码 → 符号。清单外的原样带空格（如「SGD 12.34」）。"""
+    currency = str(currency or "").strip().upper()
+    return CURRENCY_SIGNS.get(currency, f"{currency} " if currency else "")
+
+
+def _money(value: Any, currency: str | None) -> str:
+    """金额 → `¥12.34`；查不到给「—」。"""
+    if value is None:
+        return "—"
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{_currency_sign(currency)}{amount:.2f}"
+
+
+def _balance_text(server: dict[str, Any]) -> str:
+    """余额：直接显示 BSS 返回的 AvailableAmount。
+
+    国际站后付费账号恒为 0（显示 $0.00），代理商注册的预付费账号有真实余额，
+    按站点一刀切写「后付费」会把预付费的真实余额也抹掉，所以统一显示真值。
+    """
+    return _money(server.get("balance_amount"), server.get("billing_currency"))
 
 
 def report_block(server: dict[str, Any]) -> str:
@@ -442,7 +665,9 @@ def report_block(server: dict[str, Any]) -> str:
             f"┃ 📦 实例：<code>{_instance(server)}</code>",
             f"┃ 🌐 ＩＰ：{_ip(server)}",
             f"┃ 📍 地域：{_region(server)}",
-            f"┃ 📈 已用：{used:.2f} GB",
+            f"┃ 💰 费用：{_money(server.get('monthly_cost'), server.get('billing_currency'))}",
+            f"┃ 💳 余额：{_balance_text(server)}",
+            f"┃ 📈 流量：{used:.2f} GB",
             f"┃ 💾 剩余：{remain:.2f} GB",
             f"┃ 🔥 使用率：{percent:.2f}%  {color}",
         ]
@@ -450,11 +675,11 @@ def report_block(server: dict[str, Any]) -> str:
 
 
 def daily_report(servers: list[dict[str, Any]], timestamp: str) -> notify.Message:
-    """📊 每日流量报告。"""
+    """📊 每日报告。"""
     return _message(
         "daily_report",
-        "📊 <b>CDT 每日流量报告</b>",
-        "CDT 每日流量报告",
+        "📊 <b>CDT-Management 每日报告</b>",
+        "CDT-Management 每日报告",
         "\n\n".join(report_block(s) for s in servers) + f"\n\n⏰ 更新时间：{timestamp}",
     )
 
@@ -464,9 +689,11 @@ def shift_period(
     start: str,
     end: str,
 ) -> str:
-    """当前班次：班次名称（起–止）。跨天时结束标「次日」。
+    """当前班次：班次名称（起–止）。
 
     起止是 HH:MM 字符串（时刻表模式直接从成员字段拿）；没有名称时退回只写时间段。
+    结束 00:00 显示成 24:00（当天到午夜），不写「次日」—— 排班就是在一天
+    0–24 点之内切分，真正的跨天班次保存时会被拒绝。
     """
     slot_name = (slot_name or "").strip()
     start = (start or "").strip()
@@ -475,19 +702,9 @@ def shift_period(
         return slot_name or "—"
     if not end:
         return f"{slot_name}（{start}）" if slot_name else start
-    # 跨天：结束时刻 <= 开始时刻，标「次日」
-    tail = end
-    if _hhmm_minutes(end) <= _hhmm_minutes(start):
-        tail = f"次日 {end}"
-    span = f"{start}–{tail}"
+    # 结束 00:00 就是「当天到午夜」，写成 24:00 才不会读成第二天凌晨。
+    # 时刻表按一天 0–24 点切分，真正的跨天班次在保存时已被拒绝。
+    if end == "00:00" and start != "00:00":
+        end = "24:00"
+    span = f"{start}–{end}"
     return f"{slot_name}（{span}）" if slot_name else span
-
-
-def _hhmm_minutes(value: str) -> int:
-    parts = value.split(":")
-    if len(parts) != 2:
-        return -1
-    try:
-        return int(parts[0]) * 60 + int(parts[1])
-    except ValueError:
-        return -1
